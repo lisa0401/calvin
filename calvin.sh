@@ -6,7 +6,7 @@ if [ "$1" == "m" ]; then
 elif [ "$1" == "t" ]; then
     ARGUMENT="t"
 else
-    ARGUMENT="m"  # デフォルト値を"m"とする
+    ARGUMENT="t"  # デフォルト値を"m"とする
 fi
 
 # export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/calvin/ext/protobuf/src/.libs
