@@ -16,7 +16,7 @@ fi
 
 # クリーンアップと OCC バージョンのソースコピー
 rm -rf src obj
-cp -r src_calvin_occ/ src
+cp -r src_calvin_ext/ src
 cp definitions.hh src/common/definitions.hh
 
 # ビルド
