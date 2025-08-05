@@ -1,0 +1,46 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.pb.cc
+*.pb.h
+
+# Binaries
+../obj/
+../bin/
+../db/
+../db/storage/
+../db/checkpoints/
+
+# Logs and swap files
+*.log
+*.swp
+*.tmp
+*.bak
+
+# System files
+.DS_Store
+# Build artifacts
+*.o
+*.a
+*.so
+*.pb.cc
+*.pb.h
+
+# Binaries
+../obj/
+../bin/
+../db/
+../db/storage/
+../db/checkpoints/
+
+# Logs and swap files
+*.log
+*.swp
+*.tmp
+*.bak
+
+# System files
+.DS_Store
+
+

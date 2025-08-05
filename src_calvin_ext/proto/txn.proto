@@ -1,0 +1,47 @@
+// Author: Alexander Thomson (thomson@cs.yale.edu)
+// Author: Kun Ren (kun.ren@yale.edu)
+//
+// TODO(alex): Fix types for read_set and write_set.
+
+syntax = "proto2";
+
+message TxnProto {
+  required int64 txn_id = 1;
+  optional int32 txn_type = 10;
+
+  enum IsolationLevel {
+    SERIALIZABLE = 0;
+    SNAPSHOT = 1;
+    READ_COMMITTED = 2;
+    READ_UNCOMMITTED = 3;
+  };
+  optional IsolationLevel isolation_level = 11;
+
+  optional bool multipartition = 12;
+
+  repeated bytes read_set = 20;
+  repeated bytes write_set = 21;
+  repeated bytes read_write_set = 22;
+  optional bytes arg = 23;
+
+  enum Status {
+    NEW = 0;
+    ACTIVE = 1;
+    COMMITTED = 2;
+    ABORTED = 3;
+  };
+  optional Status status = 30;
+
+  repeated int32 readers = 40;
+  repeated int32 writers = 41;
+
+  // ✅ add read_versions as a repeated message
+  message ReadVersion {
+    required string key = 1;
+    required int32 version = 2;
+  }
+  repeated ReadVersion read_versions = 50;
+
+  // read-onlyトランザクションを識別するフラグを追加
+  optional bool is_read_only = 1000 [default = false];
+}
