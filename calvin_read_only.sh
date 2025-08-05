@@ -26,10 +26,12 @@ cp definitions.hh src/common/definitions.hh
 # .proto ファイルのコンパイル
 # =========================
 echo "Compiling .proto files..."
-protoc --cpp_out=./src proto/message.proto
-protoc --cpp_out=./src proto/txn.proto
-protoc --cpp_out=./src proto/tpcc.proto
-protoc --cpp_out=./src proto/tpcc_args.proto
+mkdir -p obj/proto  # ← これが必要！
+protoc -I=src/proto --cpp_out=obj/proto src/proto/message.proto
+protoc -I=src/proto --cpp_out=obj/proto src/proto/tpcc.proto
+protoc -I=src/proto --cpp_out=obj/proto src/proto/txn.proto
+protoc -I=src/proto --cpp_out=obj/proto src/proto/tpcc_args.proto
+
 
 # =========================
 # ソースコードをビルドします
