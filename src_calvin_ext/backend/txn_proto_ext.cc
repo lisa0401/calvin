@@ -16,12 +16,12 @@ bool TxnProtoExt::Execute(StorageManager *manager, const Application *app)
     }
     app->Execute(this, manager);
 
-    if (!Validate(manager))
-    {
-        return false;
-    }
+    // if (!Validate(manager))
+    // {
+    //     return false;
+    // }
 
-    ApplyWrites(manager);
+    // ApplyWrites(manager);
     return true;
 }
 
