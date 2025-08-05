@@ -9,25 +9,31 @@ elif [ "$1" == "y" ]; then
     ARGUMENT="y"
 else
     echo "Invalid argument. Use 'm' for microbenchmark, 't' for TPC-C, or 'y' for YCSB."
-    echo "Defaulting to 'm' (microbenchmark)."
+    echo "Defaulting to 'y' (YCSB)."
     ARGUMENT="y"
 fi
 
-# 必要であればライブラリパスを有効化します
-# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/calvin/ext/protobuf/src/.libs
-# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/calvin/ext/zookeeper/.libs
-# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/calvin/ext/zeromq/src/.libs
-
 # 既存のビルド成果物とソースをクリーンアップします
 echo "Cleaning up old directories..."
-rm -rf src obj
+rm -rf src obj bin db db/storage db/checkpoints
 
 # OCC版のソースコードをビルド用のディレクトリにコピーします
 echo "Copying OCC source files..."
 cp -r src_calvin/ src
 cp definitions.hh src/common/definitions.hh
 
+# =========================
+# .proto ファイルのコンパイル
+# =========================
+echo "Compiling .proto files..."
+protoc --cpp_out=./src proto/message.proto
+protoc --cpp_out=./src proto/txn.proto
+protoc --cpp_out=./src proto/tpcc.proto
+protoc --cpp_out=./src proto/tpcc_args.proto
+
+# =========================
 # ソースコードをビルドします
+# =========================
 echo "Building the source code..."
 cd src
 make clean
@@ -44,4 +50,5 @@ fi
 # 引数: <node-id> <application-type> <percent_mp>
 echo "Starting benchmark with argument: $ARGUMENT"
 bin/deployment/db 0 "$ARGUMENT" 0
+
 
