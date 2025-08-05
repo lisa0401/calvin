@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory> // std::make_unique のために追加
 
 #include "applications/microbenchmark.h"
 #include "applications/tpcc.h"
@@ -20,6 +21,8 @@
 #include "scheduler/deterministic_scheduler.h"
 #include "sequencer/sequencer.h"
 #include "proto/tpcc_args.pb.h"
+
+using std::string;
 
 map<Key, Key> latest_order_id_for_customer;
 map<Key, int> latest_order_id_for_district;
@@ -88,32 +91,27 @@ public:
         string args_string;
         args.SerializeToString(&args_string);
 
-        // New order txn
+        // --- ここから修正 ---
         int random_txn_type = rand() % 100;
-        // New order txn
+        int txn_type;
         if (random_txn_type < 45)
-        {
-            *txn = tpcc.NewTxn(txn_id, TPCC::NEW_ORDER, args_string, config_);
-        }
+            txn_type = TPCC::NEW_ORDER;
         else if (random_txn_type < 88)
-        {
-            *txn = tpcc.NewTxn(txn_id, TPCC::PAYMENT, args_string, config_);
-        }
+            txn_type = TPCC::PAYMENT;
         else if (random_txn_type < 92)
-        {
-            *txn = tpcc.NewTxn(txn_id, TPCC::ORDER_STATUS, args_string, config_);
-            args.set_multipartition(false);
-        }
+            txn_type = TPCC::ORDER_STATUS;
         else if (random_txn_type < 96)
-        {
-            *txn = tpcc.NewTxn(txn_id, TPCC::DELIVERY, args_string, config_);
-            args.set_multipartition(false);
-        }
+            txn_type = TPCC::DELIVERY;
         else
+            txn_type = TPCC::STOCK_LEVEL;
+
+        *txn = tpcc.NewTxn(txn_id, txn_type, args_string, config_);
+
+        if (txn_type == TPCC::ORDER_STATUS || txn_type == TPCC::STOCK_LEVEL || txn_type == TPCC::DELIVERY)
         {
-            *txn = tpcc.NewTxn(txn_id, TPCC::STOCK_LEVEL, args_string, config_);
             args.set_multipartition(false);
         }
+        // --- ここまで修正 ---
     }
 
 private:
