@@ -24,7 +24,7 @@ rm -rf src obj
 
 # OCC版のソースコードをビルド用のディレクトリにコピーします
 echo "Copying OCC source files..."
-cp -r src_calvin/ src
+cp -r src_calvin_read_only/ src
 cp definitions.hh src/common/definitions.hh
 
 # ソースコードをビルドします

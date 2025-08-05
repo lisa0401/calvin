@@ -4,17 +4,19 @@
 #include <iostream>
 #include <memory>
 
-#include "applications/microbenchmark.h"
 #include "applications/tpcc.h"
+#include "applications/microbenchmark.h"
+#include "applications/ycsb.h"
 #include "common/configuration.h"
 #include "common/connection.h"
+#include "common/definitions.hh" // ★★★ FIX: Include definitions header ★★★
 #include "backend/storage.h"
 #include "backend/storage_manager.h"
-#include "backend/fetching_storage.h" // Use FetchingStorage
+#include "backend/fetching_storage.h"
 #include "scheduler/deterministic_scheduler.h"
 #include "sequencer/sequencer.h"
 #include "proto/tpcc_args.pb.h"
-#include "backend/txn_proto_ext.h" // TxnProtoExtの定義のためにインクルード
+#include "backend/txn_proto_ext.h"
 
 using std::string;
 
@@ -30,7 +32,6 @@ class TClient : public Client
 public:
     TClient(Configuration *config, int percent_mp)
         : config_(config), percent_mp_(percent_mp) {}
-
     virtual ~TClient() {}
 
     virtual void GetTxn(TxnProtoExt **txn, int txn_id)
@@ -67,41 +68,45 @@ private:
 class MClient : public Client
 {
 public:
-    MClient(Configuration *config, int percent_mp)
-        : microbenchmark(config->all_nodes.size(), HOT),
+    MClient(Configuration *config, int percent_mp, Microbenchmark *app)
+        : microbenchmark_app_(app),
           config_(config),
           percent_mp_(percent_mp) {}
-
     virtual ~MClient() {}
 
     virtual void GetTxn(TxnProtoExt **txn, int txn_id)
     {
-        if (config_->all_nodes.size() > 1 && rand() % 100 < percent_mp_)
-        {
-            int other;
-            do
-            {
-                other = rand() % config_->all_nodes.size();
-            } while (other == config_->this_node_id);
-            *txn = microbenchmark.MicroTxnMP(txn_id, config_->this_node_id, other);
-        }
-        else
-        {
-            *txn = microbenchmark.MicroTxnSP(txn_id, config_->this_node_id);
-        }
+        *txn = microbenchmark_app_->NewTxn(txn_id, 0, "", config_);
     }
 
 private:
-    Microbenchmark microbenchmark;
+    Microbenchmark *microbenchmark_app_;
     Configuration *config_;
     int percent_mp_;
+};
+
+// Client implementation for YCSB
+class YClient : public Client
+{
+public:
+    YClient(Configuration *config, YCSB *app) : ycsb_app_(app), config_(config) {}
+    virtual ~YClient() {}
+
+    virtual void GetTxn(TxnProtoExt **txn, int txn_id)
+    {
+        *txn = ycsb_app_->NewTxn(txn_id, 0, "", config_);
+    }
+
+private:
+    YCSB *ycsb_app_;
+    Configuration *config_;
 };
 
 int main(int argc, char **argv)
 {
     if (argc < 4)
     {
-        fprintf(stderr, "Usage: %s <node-id> <m[icro]|t[pcc]> <percent_mp>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <node-id> <m[icro]|t[pcc]|y[csb]> <percent_mp>\n", argv[0]);
         exit(1);
     }
 
@@ -111,15 +116,13 @@ int main(int argc, char **argv)
     Configuration config(StringToInt(argv[1]), "deploy-run.conf");
     ConnectionMultiplexer multiplexer(&config);
 
-    // ConnectionMultiplexerのスレッドが起動し、接続要求を処理する準備ができるまで待機
-    // NewConnection()がnullptrを返す間はスピンし続ける
     Connection *sequencer_conn = nullptr;
     while (sequencer_conn == nullptr)
     {
         sequencer_conn = multiplexer.NewConnection("sequencer");
         if (sequencer_conn == nullptr)
         {
-            Spin(0.001); // 短くスピンしてCPUを解放
+            Spin(0.001);
         }
     }
 
@@ -129,7 +132,7 @@ int main(int argc, char **argv)
         scheduler_conn = multiplexer.NewConnection("scheduler_");
         if (scheduler_conn == nullptr)
         {
-            Spin(0.001); // 短くスピンしてCPUを解放
+            Spin(0.001);
         }
     }
 
@@ -140,26 +143,38 @@ int main(int argc, char **argv)
 
     if (argv[2][0] == 'm')
     {
-        app = std::make_unique<Microbenchmark>(config.all_nodes.size(), HOT);
-        client = std::make_unique<MClient>(&config, atoi(argv[3]));
+        auto mb_app = std::make_unique<Microbenchmark>(config.all_nodes.size(), HOT_RECORDS);
+        client = std::make_unique<MClient>(&config, atoi(argv[3]), mb_app.get());
+        app = std::move(mb_app);
     }
-    else
+    else if (argv[2][0] == 't')
     {
         app = std::make_unique<TPCC_OCC>();
         client = std::make_unique<TClient>(&config, atoi(argv[3]));
+    }
+    else if (argv[2][0] == 'y')
+    {
+        auto ycsb_app = std::make_unique<YCSB>();
+        client = std::make_unique<YClient>(&config, ycsb_app.get());
+        app = std::move(ycsb_app);
+    }
+    else
+    {
+        fprintf(stderr, "Invalid application type: %s\n", argv[2]);
+        exit(1);
     }
 
     app->InitializeStorage(backend, &config);
 
     auto sequencer = std::make_unique<Sequencer>(
         &config,
-        sequencer_conn, // 確立した接続を渡す
+        sequencer_conn,
         client.get(),
         backend);
 
     auto scheduler = std::make_unique<DeterministicScheduler>(
         &config,
-        scheduler_conn, // 確立した接続を渡す
+        scheduler_conn,
         backend,
         app.get());
 
