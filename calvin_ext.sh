@@ -19,7 +19,7 @@ rm -rf src obj bin db db/storage db/checkpoints
 
 # OCC版のソースコードをビルド用のディレクトリにコピーします
 echo "Copying OCC source files..."
-cp -r src_calvin_read_only/ src
+cp -r src_calvin_ext/ src
 cp definitions.hh src/common/definitions.hh
 
 # =========================

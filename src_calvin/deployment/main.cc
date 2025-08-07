@@ -185,7 +185,7 @@ int main(int argc, char **argv)
         const double read_ratio = 1.0;
         const double skew = 0.99;
         const uint64 db_size = DB_SIZE;
-        const uint64 hot_records = 10000; // この値はdefinitions.hhに移動するとより良い
+        const uint64 hot_records = 10; // この値はdefinitions.hhに移動するとより良い
         application = new YCSB(read_ratio, skew, db_size, hot_records);
     }
     else

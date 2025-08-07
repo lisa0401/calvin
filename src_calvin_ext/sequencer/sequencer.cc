@@ -32,8 +32,6 @@ using std::set;
 
 #ifdef LATENCY_TEST
 double sequencer_recv[SAMPLES];
-// double paxos_begin[SAMPLES];
-// double paxos_end[SAMPLES];
 double sequencer_send[SAMPLES];
 double prefetch_cold[SAMPLES];
 double scheduler_lock[SAMPLES];
@@ -55,12 +53,14 @@ void *Sequencer::RunSequencerReader(void *arg)
 }
 
 Sequencer::Sequencer(Configuration *conf,
-                     Connection *connection,
+                     Connection *rw_connection,
+                     Connection *ro_connection,
                      Client *client,
                      Storage *storage)
     : epoch_duration_(EPOCH_DURATION),
       configuration_(conf),
-      connection_(connection),
+      rw_connection_(rw_connection),
+      ro_connection_(ro_connection),
       client_(client),
       storage_(storage),
       deconstructor_invoked_(false)
@@ -71,7 +71,6 @@ Sequencer::Sequencer(Configuration *conf,
     cpu_set_t cpuset;
     pthread_attr_t attr_writer;
     pthread_attr_init(&attr_writer);
-    // pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
     CPU_ZERO(&cpuset);
     CPU_SET(SEQUENCER_WRITER_CORE, &cpuset);
@@ -158,13 +157,13 @@ void Sequencer::RunWriter()
     {
         synchronization_message.set_destination_node(i);
         if (i != static_cast<uint32>(configuration_->this_node_id))
-            connection_->Send(synchronization_message);
+            rw_connection_->Send(synchronization_message);
     }
     uint32 synchronization_counter = 1;
     while (synchronization_counter < configuration_->all_nodes.size())
     {
         synchronization_message.Clear();
-        if (connection_->GetMessage(&synchronization_message))
+        if (rw_connection_->GetMessage(&synchronization_message))
         {
             assert(synchronization_message.type() == MessageProto::EMPTY);
             synchronization_counter++;
@@ -173,7 +172,6 @@ void Sequencer::RunWriter()
     std::cout << "Starting sequencer.\n"
               << std::flush;
 
-    // Set up batch messages for each system node.
     MessageProto batch;
     batch.set_destination_channel("sequencer");
     batch.set_destination_node(-1);
@@ -183,17 +181,14 @@ void Sequencer::RunWriter()
     for (int batch_number = configuration_->this_node_id; !deconstructor_invoked_;
          batch_number += configuration_->all_nodes.size())
     {
-        // Begin epoch.
         double epoch_start = GetTime();
         batch.set_batch_number(batch_number);
         batch.clear_data();
 
-        // Collect txn requests for this epoch.
         int txn_id_offset = 0;
         while (!deconstructor_invoked_ &&
                GetTime() < epoch_start + epoch_duration_)
         {
-            // Add next txn request to batch.
             if (batch.data_size() < MAX_LOCK_BATCH_SIZE)
             {
                 TxnProto *txn;
@@ -201,17 +196,14 @@ void Sequencer::RunWriter()
                 client_->GetTxn(&txn,
                                 batch_number * MAX_LOCK_BATCH_SIZE + txn_id_offset);
 
-                // Find a bad transaction
                 if (txn->txn_id() == -1)
                 {
                     delete txn;
                     continue;
                 }
 
-                // ------------------- MODIFICATION START -------------------
-                // トランザクションがRead-Onlyかどうかを判定し、フラグを立てる
-                // write_setとread_write_setが両方とも空の場合、トランザクションは
-                // Read-Onlyであると判断できる
+                // ----------- ★★★ 修正箇所 ★★★ -----------
+                // トランザクションの中身を確認し、read_onlyフラグをSequencer自身が設定する
                 if (txn->write_set_size() == 0 && txn->read_write_set_size() == 0)
                 {
                     txn->set_read_only(true);
@@ -220,7 +212,7 @@ void Sequencer::RunWriter()
                 {
                     txn->set_read_only(false);
                 }
-                // ------------------- MODIFICATION END ---------------------
+                // -----------------------------------------
 
                 txn->SerializeToString(&txn_string);
                 batch.add_data(txn_string);
@@ -229,7 +221,6 @@ void Sequencer::RunWriter()
             }
         }
 
-        // Send this epoch's requests to Paxos service.
         batch.SerializeToString(&batch_string);
 #ifdef PAXOS
         paxos.SubmitBatch(batch_string);
@@ -252,14 +243,13 @@ void Sequencer::RunReader()
     Paxos paxos(ZOOKEEPER_CONF, true);
 #endif
 
-    // Set up batch messages for each system node.
-    map<int, MessageProto> batches;
+    map<int, MessageProto> rw_batches;
     for (map<int, Node *>::iterator it = configuration_->all_nodes.begin();
          it != configuration_->all_nodes.end(); ++it)
     {
-        batches[it->first].set_destination_channel("scheduler_");
-        batches[it->first].set_destination_node(it->first);
-        batches[it->first].set_type(MessageProto::TXN_BATCH);
+        rw_batches[it->first].set_destination_channel("scheduler_");
+        rw_batches[it->first].set_destination_node(it->first);
+        rw_batches[it->first].set_type(MessageProto::TXN_BATCH);
     }
 
     double time = GetTime();
@@ -273,7 +263,6 @@ void Sequencer::RunReader()
 
     while (!deconstructor_invoked_)
     {
-        // Get batch from Paxos service.
         string batch_string;
         MessageProto batch_message;
 #ifdef PAXOS
@@ -305,17 +294,16 @@ void Sequencer::RunReader()
                 watched_txn = txn.txn_id();
 #endif
 
-            // Compute readers & writers; store in txn proto.
             set<int> readers;
             set<int> writers;
-            for (int i = 0; i < txn.read_set_size(); i++)
-                readers.insert(configuration_->LookupPartition(txn.read_set(i)));
-            for (int i = 0; i < txn.write_set_size(); i++)
-                writers.insert(configuration_->LookupPartition(txn.write_set(i)));
-            for (int i = 0; i < txn.read_write_set_size(); i++)
+            for (int j = 0; j < txn.read_set_size(); j++)
+                readers.insert(configuration_->LookupPartition(txn.read_set(j)));
+            for (int j = 0; j < txn.write_set_size(); j++)
+                writers.insert(configuration_->LookupPartition(txn.write_set(j)));
+            for (int j = 0; j < txn.read_write_set_size(); j++)
             {
-                writers.insert(configuration_->LookupPartition(txn.read_write_set(i)));
-                readers.insert(configuration_->LookupPartition(txn.read_write_set(i)));
+                writers.insert(configuration_->LookupPartition(txn.read_write_set(j)));
+                readers.insert(configuration_->LookupPartition(txn.read_write_set(j)));
             }
 
             for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
@@ -326,24 +314,40 @@ void Sequencer::RunReader()
             bytes txn_data;
             txn.SerializeToString(&txn_data);
 
-            // Compute union of 'readers' and 'writers' (store in 'readers').
-            for (set<int>::iterator it = writers.begin(); it != writers.end(); ++it)
-                readers.insert(*it);
+            if (txn.has_read_only() && txn.read_only())
+            {
+                MessageProto ro_message;
+                ro_message.set_type(MessageProto::TXN_BATCH);
+                ro_message.set_destination_channel("ro_scheduler");
+                ro_message.add_data(txn_data);
 
-            // Insert txn into appropriate batches.
-            for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
-                batches[*it].add_data(txn_data);
+                for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
+                {
+                    ro_message.set_destination_node(*it);
+                    ro_connection_->Send(ro_message);
+                }
+            }
+            else
+            {
+                for (set<int>::iterator it = writers.begin(); it != writers.end(); ++it)
+                    readers.insert(*it);
+
+                for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
+                    rw_batches[*it].add_data(txn_data);
+            }
 
             txn_count++;
         }
 
-        // Send this epoch's requests to all schedulers.
-        for (map<int, MessageProto>::iterator it = batches.begin();
-             it != batches.end(); ++it)
+        for (map<int, MessageProto>::iterator it = rw_batches.begin();
+             it != rw_batches.end(); ++it)
         {
-            it->second.set_batch_number(batch_number);
-            connection_->Send(it->second);
-            it->second.clear_data();
+            if (it->second.data_size() > 0)
+            {
+                it->second.set_batch_number(batch_number);
+                rw_connection_->Send(it->second);
+                it->second.clear_data();
+            }
         }
         batch_number += configuration_->all_nodes.size();
         batch_count++;
@@ -356,7 +360,6 @@ void Sequencer::RunReader()
         }
 #endif
 
-        // Report output.
         if (GetTime() > time + 1)
         {
 #ifdef VERBOSE_SEQUENCER
@@ -364,7 +367,6 @@ void Sequencer::RunReader()
                       << " batches,\n"
                       << std::flush;
 #endif
-            // Reset txn count.
             time = GetTime();
             txn_count = 0;
             batch_count = 0;
