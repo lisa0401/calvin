@@ -36,7 +36,7 @@ NUM_BACKGROUND=5     # Background threads: Multiplexer, SequencerWriter, Sequenc
 # --- ファイル設定 ---
 CONFIG_FILE="cygnus-run.conf"
 BACKUP_CONFIG_FILE="${CONFIG_FILE}.bak"
-OUTPUT_CSV="throughput_ext_summary_${ARGUMENT}.csv"
+OUTPUT_CSV="throughput_latency_summary_${ARGUMENT}.csv"
 LOG_FILE="/tmp/calvin_output.log"
 
 # --- 事前準備 ---
@@ -46,7 +46,7 @@ rm -f /tmp/failed_log_*.log
 cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
 echo "✅ 設定ファイルをバックアップしました: $BACKUP_CONFIG_FILE"
 # 結果用CSVファイルのヘッダーを書き込み
-echo "Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
+echo "Threads,Average_Throughput(ops/sec),Average_Dispatcher_ms,Average_Queueing_ms,Average_Worker_ms" > "$OUTPUT_CSV"
 
 # ========================== メインループ ==========================
 for THREADS in "${THREAD_COUNTS[@]}"; do
@@ -94,8 +94,16 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
     # ========================== 測定実行 ==========================
     echo "  [3/4] 測定を実行中 ($NUM_RUNS 回)..."
     TOTAL_THROUGHPUT=0
+    TOTAL_DISPATCHER=0
+    TOTAL_QUEUEING=0
+    TOTAL_WORKER=0
     SUCCESSFUL_RUNS=0
-    THROUGHPUT_ARRAY=() # 新しい配列で各実行のスループットを保存
+
+    # 測定結果を格納する配列
+    THROUGHPUT_ARRAY=()
+    DISPATCHER_ARRAY=()
+    QUEUEING_ARRAY=()
+    WORKER_ARRAY=()
 
     for i in $(seq 1 $NUM_RUNS); do
         # データベースプログラムをバックグラウンドで起動
@@ -112,18 +120,23 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
            kill -SIGKILL "$APP_PID" 2>/dev/null
         fi
 
-        # --- スループット抽出 ---
-        # 最後の行から5行目の値を取得し、配列に追加
+        # --- 測定値抽出 ---
         THROUGHPUT=$(grep -oP 'Completed\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
+        DISPATCHER=$(grep -oP 'Dispatcher:\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
+        QUEUEING=$(grep -oP 'Queueing:\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
+        WORKER=$(grep -oP 'Worker:\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
 
-        if [ -z "$THROUGHPUT" ]; then
-            echo "    - 実行 $i/$NUM_RUNS: ⚠️ スループット抽出失敗"
+        if [ -z "$THROUGHPUT" ] || [ -z "$DISPATCHER" ] || [ -z "$QUEUEING" ] || [ -z "$WORKER" ]; then
+            echo "    - 実行 $i/$NUM_RUNS: ⚠️ 測定値抽出失敗"
             FAILED_LOG_NAME="/tmp/failed_log_threads_${THREADS}_run_${i}.log"
             mv "$LOG_FILE" "$FAILED_LOG_NAME"
             echo "      (ログを ${FAILED_LOG_NAME} に保存しました)"
         else
-            echo "    - 実行 $i/$NUM_RUNS: ✅ スループット: $THROUGHPUT ops/sec"
+            echo "    - 実行 $i/$NUM_RUNS: ✅ スループット: $THROUGHPUT ops/sec | Dispatcher: $DISPATCHER ms | Queueing: $QUEUEING ms | Worker: $WORKER ms"
             THROUGHPUT_ARRAY+=($THROUGHPUT)
+            DISPATCHER_ARRAY+=($DISPATCHER)
+            QUEUEING_ARRAY+=($QUEUEING)
+            WORKER_ARRAY+=($WORKER)
             SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1))
         fi
         rm -f "$LOG_FILE"
@@ -131,22 +144,38 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
 
     # ========================== 結果集計 ==========================
     echo "  [4/4] 結果を集計中..."
-    if [ "$SUCCESSFUL_RUNS" -gt 1 ]; then # 少なくとも2回成功した場合
+    if [ "$SUCCESSFUL_RUNS" -gt 1 ]; then
         # 最初の1回をスキップして、残りの平均を計算
-        TOTAL_THROUGHPUT=0
-        for ((j=1; j<${#THROUGHPUT_ARRAY[@]}; j++)); do
-            TOTAL_THROUGHPUT=$(awk "BEGIN {print $TOTAL_THROUGHPUT + ${THROUGHPUT_ARRAY[$j]}}")
-        done
-        # 最初の1回を除いた実行回数
         NUM_VALID_RUNS=$((SUCCESSFUL_RUNS - 1))
+        
+        TOTAL_THROUGHPUT=0
+        TOTAL_DISPATCHER=0
+        TOTAL_QUEUEING=0
+        TOTAL_WORKER=0
+
+        for ((j=1; j<SUCCESSFUL_RUNS; j++)); do
+            TOTAL_THROUGHPUT=$(awk "BEGIN {print $TOTAL_THROUGHPUT + ${THROUGHPUT_ARRAY[$j]}}")
+            TOTAL_DISPATCHER=$(awk "BEGIN {print $TOTAL_DISPATCHER + ${DISPATCHER_ARRAY[$j]}}")
+            TOTAL_QUEUEING=$(awk "BEGIN {print $TOTAL_QUEUEING + ${QUEUEING_ARRAY[$j]}}")
+            TOTAL_WORKER=$(awk "BEGIN {print $TOTAL_WORKER + ${WORKER_ARRAY[$j]}}")
+        done
+        
         AVERAGE_THROUGHPUT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_THROUGHPUT / $NUM_VALID_RUNS}")
+        AVERAGE_DISPATCHER=$(awk "BEGIN {printf \"%.2f\", $TOTAL_DISPATCHER / $NUM_VALID_RUNS}")
+        AVERAGE_QUEUEING=$(awk "BEGIN {printf \"%.2f\", $TOTAL_QUEUEING / $NUM_VALID_RUNS}")
+        AVERAGE_WORKER=$(awk "BEGIN {printf \"%.2f\", $TOTAL_WORKER / $NUM_VALID_RUNS}")
+
         echo "✅ 平均スループット ($THREADS threads): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS/$NUM_RUNS 成功, 最初の1回は除外)"
+        echo "✅ 平均レイテンシ ($THREADS threads): Dispatcher: ${AVERAGE_DISPATCHER}ms, Queueing: ${AVERAGE_QUEUEING}ms, Worker: ${AVERAGE_WORKER}ms"
     else
         AVERAGE_THROUGHPUT="N/A"
+        AVERAGE_DISPATCHER="N/A"
+        AVERAGE_QUEUEING="N/A"
+        AVERAGE_WORKER="N/A"
         echo "⚠️  $THREADS threads の実行が2回以上成功しなかったため、平均を計算できませんでした。"
     fi
 
-    echo "$THREADS,$AVERAGE_THROUGHPUT" >> "$OUTPUT_CSV"
+    echo "$THREADS,$AVERAGE_THROUGHPUT,$AVERAGE_DISPATCHER,$AVERAGE_QUEUEING,$AVERAGE_WORKER" >> "$OUTPUT_CSV"
 done
 
 # ========================== 後始末 ==========================

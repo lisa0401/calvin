@@ -54,14 +54,12 @@ class Sequencer
 public:
     // The constructor creates background threads and starts the Sequencer's main
     // loops running.
-    // ----------- ★★★ 修正箇所 (1/2) ★★★ -----------
     // コンストラクタを修正し、R/W用とR/O用に分離したConnectionを受け取る
     Sequencer(Configuration *conf,
               Connection *rw_connection,
               Connection *ro_connection,
               Client *client,
               Storage *storage);
-    // ----------------------------------------------
 
     // Halts the main loops.
     ~Sequencer();
@@ -97,11 +95,9 @@ private:
     // Configuration specifying node & system settings.
     Configuration *configuration_;
 
-    // ----------- ★★★ 修正箇所 (2/2) ★★★ -----------
     // ConnectionをR/W用とR/O用に分離
     Connection *rw_connection_; // R/Wバッチ送信用 (to LockManager)
     Connection *ro_connection_; // R/Oトランザクション送信用 (to RODispatcher)
-    // ----------------------------------------------
 
     // Client from which to get incoming txns.
     Client *client_;

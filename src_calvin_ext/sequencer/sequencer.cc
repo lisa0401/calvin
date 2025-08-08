@@ -5,7 +5,7 @@
 // serial order of transactions to which execution must maintain equivalence.
 //
 // TODO(scw): replace iostream with cstdio
-
+#define VERBOSE_SEQUENCER
 #include "sequencer/sequencer.h"
 
 #include <iostream>
@@ -202,7 +202,9 @@ void Sequencer::RunWriter()
                     continue;
                 }
 
-                // ----------- ★★★ 修正箇所 ★★★ -----------
+                // ここでタイムスタンプを設定
+                txn->set_sequencer_start_time(GetTime());
+
                 // トランザクションの中身を確認し、read_onlyフラグをSequencer自身が設定する
                 if (txn->write_set_size() == 0 && txn->read_write_set_size() == 0)
                 {
@@ -212,7 +214,6 @@ void Sequencer::RunWriter()
                 {
                     txn->set_read_only(false);
                 }
-                // -----------------------------------------
 
                 txn->SerializeToString(&txn_string);
                 batch.add_data(txn_string);
@@ -261,6 +262,10 @@ void Sequencer::RunReader()
     int watched_txn = -1;
 #endif
 
+    // エポックごとの平均レイテンシ計算用変数
+    double total_ro_latency = 0.0;
+    int ro_txn_count = 0;
+
     while (!deconstructor_invoked_)
     {
         string batch_string;
@@ -284,6 +289,13 @@ void Sequencer::RunReader()
         } while (!got_batch);
 #endif
         batch_message.ParseFromString(batch_string);
+
+        // ROトランザクションをまとめるためのバッチと宛先リストを用意
+        MessageProto ro_batch_message;
+        ro_batch_message.set_type(MessageProto::TXN_BATCH);
+        ro_batch_message.set_destination_channel("ro_scheduler");
+        set<int> ro_dest_nodes;
+
         for (int i = 0; i < batch_message.data_size(); i++)
         {
             TxnProto txn;
@@ -316,15 +328,19 @@ void Sequencer::RunReader()
 
             if (txn.has_read_only() && txn.read_only())
             {
-                MessageProto ro_message;
-                ro_message.set_type(MessageProto::TXN_BATCH);
-                ro_message.set_destination_channel("ro_scheduler");
-                ro_message.add_data(txn_data);
+                // ROトランザクションのレイテンシを計算し、合計に追加
+                if (txn.has_sequencer_start_time())
+                {
+                    double latency = GetTime() - txn.sequencer_start_time();
+                    total_ro_latency += latency;
+                    ro_txn_count++;
+                }
 
+                // ROトランザクションをバッチに追加する
+                ro_batch_message.add_data(txn_data);
                 for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
                 {
-                    ro_message.set_destination_node(*it);
-                    ro_connection_->Send(ro_message);
+                    ro_dest_nodes.insert(*it);
                 }
             }
             else
@@ -339,6 +355,17 @@ void Sequencer::RunReader()
             txn_count++;
         }
 
+        // ループを抜けた後、ROバッチをまとめて送信
+        if (ro_batch_message.data_size() > 0)
+        {
+            for (set<int>::iterator it = ro_dest_nodes.begin(); it != ro_dest_nodes.end(); ++it)
+            {
+                ro_batch_message.set_destination_node(*it);
+                ro_connection_->Send(ro_batch_message);
+            }
+        }
+
+        // R/Wバッチの送信
         for (map<int, MessageProto>::iterator it = rw_batches.begin();
              it != rw_batches.end(); ++it)
         {
@@ -364,12 +391,19 @@ void Sequencer::RunReader()
         {
 #ifdef VERBOSE_SEQUENCER
             std::cout << "Submitted " << txn_count << " txns in " << batch_count
-                      << " batches,\n"
-                      << std::flush;
+                      << " batches.\n";
+            // 1秒間の平均レイテンシを出力
+            if (ro_txn_count > 0)
+            {
+                double average_latency = total_ro_latency / ro_txn_count;
+                std::cout << "Average RO Txn Sequencer's latency for this epoch: " << average_latency << " seconds.\n";
+            }
 #endif
             time = GetTime();
             txn_count = 0;
             batch_count = 0;
+            total_ro_latency = 0.0;
+            ro_txn_count = 0;
         }
     }
     Spin(1);

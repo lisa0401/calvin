@@ -57,4 +57,10 @@ message TxnProto {
   // A flag indicating that this transaction is read-only.
   // Set by the sequencer.
   optional bool read_only = 42;
+    optional double time_sequencer_begin = 100; // シーケンサー処理開始時刻
+  optional double time_sequencer_end   = 101; // シーケンサー処理終了時刻
+  optional double time_worker_begin    = 102; // ワーカー処理開始時刻
+  optional double time_worker_end      = 103; // ワーカー処理終了時刻
+  optional double sequencer_start_time = 104; // ← この行が原因です
+  
 }

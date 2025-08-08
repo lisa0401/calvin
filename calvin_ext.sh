@@ -52,5 +52,3 @@ fi
 # 引数: <node-id> <application-type> <percent_mp>
 echo "Starting benchmark with argument: $ARGUMENT"
 bin/deployment/db 0 "$ARGUMENT" 0
-
-
