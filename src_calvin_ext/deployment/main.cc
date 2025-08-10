@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <string> // stringとIntToStringのために追加
 
 #include "applications/application.h"
 #include "applications/microbenchmark.h"
@@ -24,7 +25,7 @@
 #include "proto/tpcc_args.pb.h"
 #include "proto/txn.pb.h"
 
-// グローバル変数
+// グローバル変数 (変更なし)
 map<Key, Key> latest_order_id_for_customer;
 map<Key, int> latest_order_id_for_district;
 map<Key, int> smallest_order_id_for_district;
@@ -37,7 +38,7 @@ vector<Key> *involed_customers;
 pthread_mutex_t mutex_;
 pthread_mutex_t mutex_for_item;
 
-// Microbenchmark用クライアント
+// Clientクラス定義 (変更なし)
 class MClient : public Client
 {
 public:
@@ -71,7 +72,6 @@ private:
     int percent_mp_;
 };
 
-// TPCC用クライアント
 class TClient : public Client
 {
 public:
@@ -116,7 +116,6 @@ private:
     TPCC *tpcc_;
 };
 
-// YCSB用クライアント
 class YClient : public Client
 {
 public:
@@ -143,7 +142,7 @@ void stop(int sig)
 
 int main(int argc, char **argv)
 {
-    // 引数チェック
+    // 引数チェックとシグナルハンドラ設定 (変更なし)
     if (argc < 4)
     {
         fprintf(stderr, "Usage: %s <node-id> <m[icro]|t[pcc]|y[csb]> <percent_mp> [f for fetching]\n",
@@ -151,17 +150,14 @@ int main(int argc, char **argv)
         exit(1);
     }
     bool useFetching = (argc > 4 && argv[4][0] == 'f');
-
     signal(SIGINT, &stop);
     signal(SIGTERM, &stop);
 
-    // 設定オブジェクトの構築
+    // 設定とマルチプレクサの構築 (変更なし)
     Configuration config(StringToInt(argv[1]), "deploy-run.conf");
-
-    // 通信マルチプレクサの構築と起動
     ConnectionMultiplexer multiplexer(&config);
 
-    // ベンチマークの種類に応じてApplicationオブジェクトを生成
+    // ApplicationとClientの生成 (変更なし)
     Application *application;
     if (argv[2][0] == 'm')
     {
@@ -173,11 +169,10 @@ int main(int argc, char **argv)
     }
     else if (argv[2][0] == 'y')
     {
-        // YCSBのパラメータをここで自由に設定
         const double read_ratio = 1.0;
         const double skew = 0.99;
         const uint64 db_size = DB_SIZE;
-        const uint64 hot_records = 10; // この値はdefinitions.hhに移動するとより良い
+        const uint64 hot_records = 10;
         application = new YCSB(read_ratio, skew, db_size, hot_records);
     }
     else
@@ -186,7 +181,6 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    // Applicationオブジェクトに対応するClientオブジェクトを生成
     Client *client;
     if (argv[2][0] == 'm')
     {
@@ -196,16 +190,15 @@ int main(int argc, char **argv)
     {
         client = new TClient(&config, atoi(argv[3]), application);
     }
-    else // 'y'
+    else
     {
         client = new YClient(&config, atoi(argv[3]), application);
     }
 
+    // MutexとStorageの初期化 (変更なし)
     pthread_mutex_init(&mutex_, NULL);
     pthread_mutex_init(&mutex_for_item, NULL);
     involed_customers = new vector<Key>;
-
-    // ストレージ層の選択と初期化
     Storage *storage;
     if (!useFetching)
     {
@@ -219,23 +212,27 @@ int main(int argc, char **argv)
     application->InitializeStorage(storage, &config);
 
     // ----------- ★★★ 修正箇所 ★★★ -----------
-    // R/W用とR/O用に、それぞれ専用の通信路を生成する
+    // R/W用と、複数のR/O用に通信路を生成する
 
-    // R/Wトランザクション用の通信路。LockManagerThreadに繋がる。
+    // R/Wトランザクション用の通信路
     Connection *rw_connection = multiplexer.NewConnection("scheduler_");
 
-    // R/Oトランザクション用の通信路。RODispatcherThreadに直接繋がる。
-    Connection *ro_connection = multiplexer.NewConnection("ro_scheduler");
+    // 複数のR/Oトランザクション用通信路を生成
+    vector<Connection *> *ro_connections = new vector<Connection *>();
+    for (int i = 0; i < NUM_RO_DISPATCHERS; i++)
+    {
+        // 各Dispatcherがリッスンする一意のチャネル名を作成
+        string channel_name = "ro_scheduler_" + IntToString(i);
+        ro_connections->push_back(multiplexer.NewConnection(channel_name));
+    }
 
     // シーケンサコンポーネントの初期化と起動
-    // 修正されたコンストラクタに、2つの通信路を渡す
-    Sequencer sequencer(&config, rw_connection, ro_connection, client, storage);
+    Sequencer sequencer(&config, rw_connection, ro_connections, client, storage);
 
     // スケジューラをメインスレッドで実行
-    // こちらも同様に、2つの通信路を渡す
     DeterministicScheduler scheduler(&config,
                                      rw_connection,
-                                     ro_connection,
+                                     ro_connections,
                                      storage,
                                      application);
     // -----------------------------------------
@@ -248,6 +245,14 @@ int main(int argc, char **argv)
     delete application;
     delete storage;
     delete involed_customers;
+
+    // ★★★ 追加：Connectionオブジェクトの解放 ★★★
+    for (Connection *conn : *ro_connections)
+    {
+        delete conn;
+    }
+    delete ro_connections;
+    delete rw_connection;
 
     return 0;
 }

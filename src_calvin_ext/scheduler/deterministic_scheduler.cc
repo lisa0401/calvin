@@ -1,5 +1,3 @@
-// scheduler/deterministic_scheduler.cc (全文)
-
 #include "scheduler/deterministic_scheduler.h"
 
 #include <cstdlib>
@@ -10,6 +8,8 @@
 #include <sched.h>
 #include <map>
 #include <vector>
+#include <unistd.h> // usleep()のために追加
+
 #include "applications/application.h"
 #include "common/utils.h"
 #include "common/zmq.hpp"
@@ -34,19 +34,28 @@ static void DeleteTxnPtr(void *data, void *hint)
     free(data);
 }
 
+// ★★★ 修正箇所 No.1 ★★★
+// RODispatcherThread: 自身のIDを受け取り、担当のConnectionから受信する
 void *DeterministicScheduler::RODispatcherThread(void *arg)
 {
-    DeterministicScheduler *scheduler = reinterpret_cast<DeterministicScheduler *>(arg);
-    PrintCpu("RO Dispatcher", 0);
+    pair<int, DeterministicScheduler *> *args = reinterpret_cast<pair<int, DeterministicScheduler *> *>(arg);
+    int dispatcher_id = args->first;
+    DeterministicScheduler *scheduler = args->second;
+    delete args; // 引数用に確保されたメモリを解放
+
+    PrintCpu("RO Dispatcher", dispatcher_id);
+
+    std::vector<std::vector<TxnProto *>> local_batches(NUM_WORKERS);
 
     MessageProto message;
     while (true)
     {
-        if (scheduler->ro_connection_->GetMessage(&message))
+        // 自身のIDに対応するConnectionからメッセージを受信
+        if ((*scheduler->ro_connections_)[dispatcher_id]->GetMessage(&message))
         {
             assert(message.type() == MessageProto::TXN_BATCH);
 
-            // ★★★ 変更点：バッチを解析し、個別のTxnを共有キューに投入 ★★★
+            // ① 仕分けフェーズ
             double batch_recv_time = GetTime();
             for (int i = 0; i < message.data_size(); i++)
             {
@@ -54,10 +63,26 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
                 txn->ParseFromString(message.data(i));
 
                 txn->set_time_sequencer_begin(batch_recv_time);
-                txn->set_time_sequencer_end(GetTime()); // 個別TxnをPushする時刻を記録
+                txn->set_time_sequencer_end(GetTime());
 
                 scheduler->executing_txns_++;
-                scheduler->shared_ro_queue_->Push(txn);
+
+                uint64_t dest_worker = i % NUM_WORKERS;
+                local_batches[dest_worker].push_back(txn);
+            }
+
+            // ② 一括投入フェーズ
+            for (uint64_t i = 0; i < NUM_WORKERS; ++i)
+            {
+                if (!local_batches[i].empty())
+                {
+                    std::lock_guard<std::mutex> lock(scheduler->worker_ro_queues_[i].m);
+                    scheduler->worker_ro_queues_[i].q.insert(
+                        scheduler->worker_ro_queues_[i].q.end(),
+                        local_batches[i].begin(),
+                        local_batches[i].end());
+                    local_batches[i].clear();
+                }
             }
         }
     }
@@ -80,33 +105,33 @@ TxnProto *DeterministicScheduler::GetTxnPtr(socket_t *socket, zmq::message_t *ms
     return txn;
 }
 
+// ★★★ 修正箇所 No.2 ★★★
+// コンストラクタ: 複数のRO Connectionを受け取り、複数のDispatcherスレッドを生成
 DeterministicScheduler::DeterministicScheduler(Configuration *conf,
                                                Connection *rw_connection,
-                                               Connection *ro_connection,
+                                               vector<Connection *> *ro_connections,
                                                Storage *storage,
                                                const Application *application)
     : configuration_(conf),
       rw_connection_(rw_connection),
-      ro_connection_(ro_connection),
+      ro_connections_(ro_connections),
       storage_(storage),
       application_(application),
-      executing_txns_(0)
+      executing_txns_(0),
+      worker_ro_queues_(NUM_WORKERS)
 {
     ready_txns_ = new std::deque<TxnProto *>();
     lock_manager_ = new DeterministicLockManager(ready_txns_, configuration_);
 
-    // ★★★ 変更点：キューの初期化方法を変更 ★★★
     rw_txns_queue_ = new AtomicQueue<TxnProto *>();
-    shared_ro_queue_ = new AtomicQueue<TxnProto *>(); // 共有キューを初期化
     done_queue = new AtomicQueue<TxnProto *>();
 
     for (int i = 0; i < NUM_WORKERS; i++)
     {
         message_queues[i] = new AtomicQueue<MessageProto>();
     }
-    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
-    // 全ての測定用変数を初期化
+    // (測定用変数の初期化は変更なし)
     total_ro_dispatch_time_ = 0;
     total_ro_queueing_time_ = 0;
     total_ro_worker_time_ = 0;
@@ -119,13 +144,21 @@ DeterministicScheduler::DeterministicScheduler(Configuration *conf,
     Spin(1);
 
     cpu_set_t cpuset;
-    pthread_attr_t attr_ro_dispatcher;
-    pthread_attr_init(&attr_ro_dispatcher);
-    CPU_ZERO(&cpuset);
-    CPU_SET(RO_DISPATCHER_CORE, &cpuset);
-    pthread_attr_setaffinity_np(&attr_ro_dispatcher, sizeof(cpu_set_t), &cpuset);
-    pthread_create(&ro_dispatcher_thread_, &attr_ro_dispatcher, RODispatcherThread, reinterpret_cast<void *>(this));
 
+    // 複数のRODispatcherスレッドを生成
+    for (int i = 0; i < NUM_RO_DISPATCHERS; i++)
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        CPU_ZERO(&cpuset);
+        CPU_SET(GET_RO_DISPATCHER_CORE(i), &cpuset);
+        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+
+        pair<int, DeterministicScheduler *> *arg = new pair<int, DeterministicScheduler *>(i, this);
+        pthread_create(&(ro_dispatcher_threads_[i]), &attr, RODispatcherThread, reinterpret_cast<void *>(arg));
+    }
+
+    // LockManagerスレッド生成 (変更なし)
     pthread_attr_t attr_lock_manager;
     pthread_attr_init(&attr_lock_manager);
     CPU_ZERO(&cpuset);
@@ -133,6 +166,7 @@ DeterministicScheduler::DeterministicScheduler(Configuration *conf,
     pthread_attr_setaffinity_np(&attr_lock_manager, sizeof(cpu_set_t), &cpuset);
     pthread_create(&lock_manager_thread_, &attr_lock_manager, LockManagerThread, reinterpret_cast<void *>(this));
 
+    // Workerスレッド生成 (変更なし)
     for (int i = 0; i < NUM_WORKERS; i++)
     {
         string channel("scheduler");
@@ -153,17 +187,20 @@ DeterministicScheduler::~DeterministicScheduler()
     delete lock_manager_;
     delete rw_txns_queue_;
     delete done_queue;
-    delete shared_ro_queue_; // 共有キューを解放
     for (int i = 0; i < NUM_WORKERS; i++)
     {
         delete message_queues[i];
     }
 }
 
+// RunWorkerThread (最終修正版)
+
 void *DeterministicScheduler::RunWorkerThread(void *arg)
 {
-    int thread_id = reinterpret_cast<pair<int, DeterministicScheduler *> *>(arg)->first;
-    DeterministicScheduler *scheduler = reinterpret_cast<pair<int, DeterministicScheduler *> *>(arg)->second;
+    pair<int, DeterministicScheduler *> *args_pair = reinterpret_cast<pair<int, DeterministicScheduler *> *>(arg);
+    int thread_id = args_pair->first;
+    DeterministicScheduler *scheduler = args_pair->second;
+    delete args_pair;
 
     const int NUM_RW_WORKERS = 1;
     bool is_rw_worker = (thread_id < NUM_RW_WORKERS);
@@ -193,54 +230,90 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
         }
         else
         {
-            // ★★★ 変更点：共有キューから仕事を取得するロジック ★★★
             TxnProto *txn = NULL;
-            bool got_txn = false;
 
+            // --- ワークスティーリング・ロジック (変更なし) ---
             if (is_rw_worker)
             {
-                // RWワーカーはまずRWキューを試す
                 if (scheduler->rw_txns_queue_->Pop(&txn))
                 {
-                    got_txn = true;
                 }
             }
-
-            // RWの仕事がなかった場合、またはROワーカーの場合、共有ROキューを試す
-            if (!got_txn)
+            if (txn == NULL)
             {
-                if (scheduler->shared_ro_queue_->Pop(&txn))
+                std::lock_guard<std::mutex> lock(scheduler->worker_ro_queues_[thread_id].m);
+                if (!scheduler->worker_ro_queues_[thread_id].q.empty())
                 {
-                    got_txn = true;
+                    txn = scheduler->worker_ro_queues_[thread_id].q.back();
+                    scheduler->worker_ro_queues_[thread_id].q.pop_back();
                 }
             }
-
-            if (got_txn)
+            if (txn == NULL)
             {
-                // トランザクションを処理（RWでもROでも共通）
+                int victim_id = rand() % NUM_WORKERS;
+                if (victim_id != thread_id)
+                {
+                    std::unique_lock<std::mutex> lock(scheduler->worker_ro_queues_[victim_id].m, std::try_to_lock);
+                    if (lock.owns_lock() && !scheduler->worker_ro_queues_[victim_id].q.empty())
+                    {
+                        txn = scheduler->worker_ro_queues_[victim_id].q.front();
+                        scheduler->worker_ro_queues_[victim_id].q.pop_front();
+                    }
+                }
+            }
+            // ------------------------------------
+
+            if (txn != NULL)
+            {
                 txn->set_time_worker_begin(GetTime());
-                StorageManager *manager = new StorageManager(
-                    scheduler->configuration_, scheduler->thread_connections_[thread_id],
-                    scheduler->storage_, txn);
 
-                if (manager->ReadyToExecute())
+                if (txn->read_only())
                 {
-                    scheduler->application_->Execute(txn, manager);
+                    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                    // ★★★ RO用の高速パス：deleteを削除 ★★★
+                    // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                    for (int i = 0; i < txn->read_set_size(); i++)
+                    {
+                        // ReadObjectを呼び出すだけで、ポインタは解放しない
+                        scheduler->storage_->ReadObject(txn->read_set(i));
+                    }
+                    for (int i = 0; i < txn->read_write_set_size(); i++)
+                    {
+                        scheduler->storage_->ReadObject(txn->read_write_set(i));
+                    }
+
                     txn->set_time_worker_end(GetTime());
-                    delete manager;
                     scheduler->done_queue->Push(txn);
                 }
                 else
                 {
-                    scheduler->thread_connections_[thread_id]->LinkChannel(IntToString(txn->txn_id()));
-                    active_txns[IntToString(txn->txn_id())] = manager;
+                    // --- R/Wトランザクション用の従来の非同期パス ---
+                    StorageManager *manager = new StorageManager(
+                        scheduler->configuration_, scheduler->thread_connections_[thread_id],
+                        scheduler->storage_, txn);
+
+                    if (manager->ReadyToExecute())
+                    {
+                        scheduler->application_->Execute(txn, manager);
+                        txn->set_time_worker_end(GetTime());
+                        delete manager;
+                        scheduler->done_queue->Push(txn);
+                    }
+                    else
+                    {
+                        scheduler->thread_connections_[thread_id]->LinkChannel(IntToString(txn->txn_id()));
+                        active_txns[IntToString(txn->txn_id())] = manager;
+                    }
                 }
+            }
+            else
+            {
+                usleep(100);
             }
         }
     }
     return NULL;
 }
-
 MessageProto *GetBatch(int batch_id, Connection *connection, unordered_map<int, MessageProto *> *batches)
 {
     if (batches->count(batch_id) > 0)

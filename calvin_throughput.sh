@@ -25,10 +25,10 @@ echo "✅ 設定ファイルをバックアップ: $BACKUP_CONFIG_FILE"
 OUTPUT_CSV="throughput_summary_${ARGUMENT}.csv"
 echo "Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
 
-THREAD_COUNTS=(1 2 4 8 16 32 48 64 72 80 88 91) # テストするワーカー・スレッド数のリスト
+THREAD_COUNTS=(1 2 4 8 16 32 48 64 72 90) # テストするワーカー・スレッド数のリスト
 RUN_DURATION=10
 NUM_RUNS=10
-NUM_BACKGROUND=4
+NUM_BACKGROUND=5
 
 # ========================== メインループ ==========================
 for THREADS in "${THREAD_COUNTS[@]}"; do
@@ -40,7 +40,7 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
     # ソース復元と定義ファイル更新
     rm -rf src obj
     cp -r src_calvin/ src
-    cp definition_calvin_throughput.hh src/common/definitions.hh
+    cp definition_throughput.hh src/common/definitions.hh
 
     echo "Compiling .proto files..."
     mkdir -p obj/proto  # ← これが必要！

@@ -54,41 +54,35 @@ void *Sequencer::RunSequencerReader(void *arg)
 
 Sequencer::Sequencer(Configuration *conf,
                      Connection *rw_connection,
-                     Connection *ro_connection,
+                     vector<Connection *> *ro_connections,
                      Client *client,
                      Storage *storage)
     : epoch_duration_(EPOCH_DURATION),
       configuration_(conf),
       rw_connection_(rw_connection),
-      ro_connection_(ro_connection),
+      ro_connections_(ro_connections), // ★ メンバー変数を初期化
       client_(client),
       storage_(storage),
       deconstructor_invoked_(false)
 {
     pthread_mutex_init(&mutex_, NULL);
-    // Start Sequencer main loops running in background thread.
 
+    // (スレッド生成部分は変更なし)
     cpu_set_t cpuset;
     pthread_attr_t attr_writer;
     pthread_attr_init(&attr_writer);
-
     CPU_ZERO(&cpuset);
     CPU_SET(SEQUENCER_WRITER_CORE, &cpuset);
     pthread_attr_setaffinity_np(&attr_writer, sizeof(cpu_set_t), &cpuset);
+    pthread_create(&writer_thread_, &attr_writer, RunSequencerWriter, reinterpret_cast<void *>(this));
 
-    pthread_create(&writer_thread_, &attr_writer, RunSequencerWriter,
-                   reinterpret_cast<void *>(this));
-
-    CPU_ZERO(&cpuset);
-    CPU_SET(SEQUENCER_READER_CORE, &cpuset);
     pthread_attr_t attr_reader;
     pthread_attr_init(&attr_reader);
+    CPU_ZERO(&cpuset);
+    CPU_SET(SEQUENCER_READER_CORE, &cpuset);
     pthread_attr_setaffinity_np(&attr_reader, sizeof(cpu_set_t), &cpuset);
-
-    pthread_create(&reader_thread_, &attr_reader, RunSequencerReader,
-                   reinterpret_cast<void *>(this));
+    pthread_create(&reader_thread_, &attr_reader, RunSequencerReader, reinterpret_cast<void *>(this));
 }
-
 Sequencer::~Sequencer()
 {
     deconstructor_invoked_ = true;
@@ -253,16 +247,11 @@ void Sequencer::RunReader()
         rw_batches[it->first].set_type(MessageProto::TXN_BATCH);
     }
 
+    uint64_t next_dispatcher = 0;
     double time = GetTime();
     int txn_count = 0;
     int batch_count = 0;
     int batch_number = configuration_->this_node_id;
-
-#ifdef LATENCY_TEST
-    int watched_txn = -1;
-#endif
-
-    // エポックごとの平均レイテンシ計算用変数
     double total_ro_latency = 0.0;
     int ro_txn_count = 0;
 
@@ -290,21 +279,20 @@ void Sequencer::RunReader()
 #endif
         batch_message.ParseFromString(batch_string);
 
-        // ROトランザクションをまとめるためのバッチと宛先リストを用意
         MessageProto ro_batch_message;
         ro_batch_message.set_type(MessageProto::TXN_BATCH);
-        ro_batch_message.set_destination_channel("ro_scheduler");
+
+        string ro_channel_name = "ro_scheduler_" + IntToString(next_dispatcher);
+        ro_batch_message.set_destination_channel(ro_channel_name);
         set<int> ro_dest_nodes;
 
+        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        // ★★★ ここにループの中身を正しく復元します ★★★
+        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
         for (int i = 0; i < batch_message.data_size(); i++)
         {
             TxnProto txn;
             txn.ParseFromString(batch_message.data(i));
-
-#ifdef LATENCY_TEST
-            if (txn.txn_id() % SAMPLE_RATE == 0)
-                watched_txn = txn.txn_id();
-#endif
 
             set<int> readers;
             set<int> writers;
@@ -328,15 +316,12 @@ void Sequencer::RunReader()
 
             if (txn.has_read_only() && txn.read_only())
             {
-                // ROトランザクションのレイテンシを計算し、合計に追加
                 if (txn.has_sequencer_start_time())
                 {
                     double latency = GetTime() - txn.sequencer_start_time();
                     total_ro_latency += latency;
                     ro_txn_count++;
                 }
-
-                // ROトランザクションをバッチに追加する
                 ro_batch_message.add_data(txn_data);
                 for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
                 {
@@ -347,25 +332,22 @@ void Sequencer::RunReader()
             {
                 for (set<int>::iterator it = writers.begin(); it != writers.end(); ++it)
                     readers.insert(*it);
-
                 for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
                     rw_batches[*it].add_data(txn_data);
             }
-
             txn_count++;
         }
 
-        // ループを抜けた後、ROバッチをまとめて送信
         if (ro_batch_message.data_size() > 0)
         {
             for (set<int>::iterator it = ro_dest_nodes.begin(); it != ro_dest_nodes.end(); ++it)
             {
                 ro_batch_message.set_destination_node(*it);
-                ro_connection_->Send(ro_batch_message);
+                (*ro_connections_)[next_dispatcher]->Send(ro_batch_message);
             }
+            next_dispatcher = (next_dispatcher + 1) % ro_connections_->size();
         }
 
-        // R/Wバッチの送信
         for (map<int, MessageProto>::iterator it = rw_batches.begin();
              it != rw_batches.end(); ++it)
         {
@@ -379,20 +361,11 @@ void Sequencer::RunReader()
         batch_number += configuration_->all_nodes.size();
         batch_count++;
 
-#ifdef LATENCY_TEST
-        if (watched_txn != -1)
-        {
-            sequencer_send[watched_txn] = GetTime();
-            watched_txn = -1;
-        }
-#endif
-
         if (GetTime() > time + 1)
         {
 #ifdef VERBOSE_SEQUENCER
             std::cout << "Submitted " << txn_count << " txns in " << batch_count
                       << " batches.\n";
-            // 1秒間の平均レイテンシを出力
             if (ro_txn_count > 0)
             {
                 double average_latency = total_ro_latency / ro_txn_count;

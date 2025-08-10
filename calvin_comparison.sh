@@ -1,8 +1,13 @@
+
+
 #!/bin/bash
 
 # ==============================================================================
-# Calvin系データベース性能測定スクリプト (Dispatcher複数化対応・最終版)
+# Calvin 比較実験用スクリプト (96コアサーバー向け)
 # ==============================================================================
+
+# --- 比較対象を設定 ('original' または 'proposed') ---
+TARGET="proposed" # ここを 'original' に変えて元カルバンを測定
 
 # --- 引数処理 ---
 if [ "$1" == "m" ]; then
@@ -16,66 +21,89 @@ else
     exit 1
 fi
 echo "🧪 使用するベンチマーク: $ARGUMENT"
+echo "🎯 測定対象: $TARGET"
 
 # ========================== 実験パラメータ ==========================
-# ★★★ ここでDispatcherの数を変更して実験します ★★★
-NUM_DISPATCHERS=1
+if [ "$TARGET" == "original" ]; then
+    NUM_BACKGROUND=4
+    DEFINITIONS_FILE="definitions_original.hh"
+    SOURCE_DIR="src_calvin" # 元カルバンのソースディレクトリ
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_original.csv"
+else
+    # 提案手法 (Dispatcherは1つで実験する例)
+    NUM_DISPATCHERS=1
+    OTHER_BACKGROUND_THREADS=4
+    NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
+    DEFINITIONS_FILE="definitions_proposed.hh"
+    SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}.csv"
+fi
 
-# テストするワーカー・スレッド数のリスト
-THREAD_COUNTS=(1 2 4 8 16 32 48 64 72 90)
-RUN_DURATION=10      # 1回あたりの実行時間 (秒)
-NUM_RUNS=10           # 各スレッド数で試行する回数
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★★★ ここを修正：96コアサーバー向けにテスト範囲を拡張 ★★★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80 88 92)
+
+RUN_DURATION=10
+NUM_RUNS=5
 
 # --- 基本設定 ---
 SCRIPT_DIR=$(dirname "$0")
 cd "$SCRIPT_DIR" || exit 1
-
-# ★★★ 修正箇所: バックグラウンドスレッド数を動的に計算 ★★★
-# LockManager, Sequencer x2, Multiplexer の合計
-OTHER_BACKGROUND_THREADS=4
-NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
-
-# --- ファイル設定 ---
 CONFIG_FILE="cygnus-run.conf"
 BACKUP_CONFIG_FILE="${CONFIG_FILE}.bak"
-OUTPUT_CSV="throughput_summary_${ARGUMENT}_dispatchers_${NUM_DISPATCHERS}.csv"
 LOG_FILE="/tmp/calvin_output.log"
 
 # --- 事前準備 ---
 rm -f /tmp/failed_log_*.log
 cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
-echo "✅ 設定ファイルをバックアップしました: $BACKUP_CONFIG_FILE"
+echo "✅ 設定ファイルをバックアップ: $BACKUP_CONFIG_FILE"
 echo "Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
 
 # ========================== メインループ ==========================
 for THREADS in "${THREAD_COUNTS[@]}"; do
-    echo -e "\n======== ワーカー数: $THREADS (Dispatcher数: $NUM_DISPATCHERS) ========"
+    echo -e "\n======== Total Cores for Workers+Dispatchers: $THREADS ========"
 
-    # --- ビルド設定 ---
-    NUM_WORKERS=$THREADS
+    # --- 公平な比較のためのワーカー数調整 ---
+    if [ "$TARGET" == "original" ]; then
+        NUM_WORKERS=$THREADS
+    else
+        NUM_WORKERS=$((THREADS - NUM_DISPATCHERS))
+        if [ "$NUM_WORKERS" -lt 1 ]; then
+            echo "ワーカー数が1未満になるためスキップします。"
+            continue
+        fi
+    fi
+    
     NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
+    if [ "$NUM_CORE" -gt 96 ]; then
+        echo "合計コア数($NUM_CORE)がサーバーの上限(96)を超えるためスキップします。"
+        continue
+    fi
+    
+    echo "  - Configuration: Workers=$NUM_WORKERS, Background=$NUM_BACKGROUND, TotalCores=$NUM_CORE"
 
     # --- ソースコードと定義ファイルの更新 ---
     echo "  [1/4] ソースコードと定義ファイルを更新中..."
     rm -rf src obj
-    cp -r src_calvin_ext/ src
-    cp definitions_throughput.hh src/common/definitions.hh # テンプレートファイルを使用
+    cp -r "$SOURCE_DIR"/ src
+    cp "$DEFINITIONS_FILE" src/common/definitions.hh
 
-    # ★★★ 修正箇所: sedでNUM_RO_DISPATCHERSも置換 ★★★
+    # sedで各種マクロを置換
     sed -i -E "s/^#define[[:space:]]+NUM_CORE[[:space:]]+.*$/#define NUM_CORE $NUM_CORE/" src/common/definitions.hh
-    sed -i -E "s/^#define[[:space:]]+NUM_RO_DISPATCHERS[[:space:]]+.*$/#define NUM_RO_DISPATCHERS $NUM_DISPATCHERS/" src/common/definitions.hh
-    
-    echo "      - NUM_WORKERS=$NUM_WORKERS, NUM_DISPATCHERS=$NUM_DISPATCHERS, NUM_CORE=$NUM_CORE に設定しました。"
-
+    sed -i -E "s/^#define[[:space:]]+NUM_BACKGROUND_THREADS[[:space:]]+.*$/#define NUM_BACKGROUND_THREADS $NUM_BACKGROUND/" src/common/definitions.hh
+    sed -i -E "s/^#define[[:space:]]+NUM_WORKERS[[:space:]]+.*$/#define NUM_WORKERS $NUM_WORKERS/" src/common/definitions.hh
+    if [ "$TARGET" != "original" ]; then
+        sed -i -E "s/^#define[[:space:]]+NUM_RO_DISPATCHERS[[:space:]]+.*$/#define NUM_RO_DISPATCHERS $NUM_DISPATCHERS/" src/common/definitions.hh
+    fi
     # --- ビルド ---
     echo "  [2/4] ビルドを実行中..."
     cd src
     make clean > /dev/null 2>&1
-    # ビルド出力を表示するように変更
     if make -j$(nproc); then
         echo "      - ビルド成功。"
     else
-        echo "      - ❌ ビルド失敗 ($THREADS threads)。このスレッド数のテストをスキップします。"
+        echo "      - ❌ ビルド失敗 (Workers=$NUM_WORKERS)。スキップします。"
         cd ..
         continue
     fi
