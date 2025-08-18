@@ -2,30 +2,35 @@
 // Author: Alexander Thomson (thomson@cs.yale.edu)
 //
 // Main invokation of a single node in the system.
-
+#include "common/random.hh"
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-#include <string> // stringとIntToStringのために追加
+#include <string>
+#include <random>
 
 #include "applications/application.h"
 #include "applications/microbenchmark.h"
 #include "applications/tpcc.h"
 #include "applications/ycsb.h"
+
 #include "common/configuration.h"
 #include "common/connection.h"
 #include "common/definitions.hh"
+
 #include "backend/simple_storage.h"
 #include "backend/fetching_storage.h"
 #include "backend/collapsed_versioned_storage.h"
+
 #include "scheduler/serial_scheduler.h"
 #include "scheduler/deterministic_scheduler.h"
 #include "sequencer/sequencer.h"
+
 #include "proto/tpcc_args.pb.h"
 #include "proto/txn.pb.h"
 
-// グローバル変数 (変更なし)
+// ---- Global ----
 map<Key, Key> latest_order_id_for_customer;
 map<Key, int> latest_order_id_for_district;
 map<Key, int> smallest_order_id_for_district;
@@ -38,16 +43,14 @@ vector<Key> *involed_customers;
 pthread_mutex_t mutex_;
 pthread_mutex_t mutex_for_item;
 
-// Clientクラス定義 (変更なし)
+// ---- Clients ----
 class MClient : public Client
 {
 public:
     MClient(Configuration *config, int mp, Application *app)
-        : microbenchmark_(static_cast<Microbenchmark *>(app)), config_(config),
-          percent_mp_(mp)
-    {
-    }
-
+        : microbenchmark_(static_cast<Microbenchmark *>(app)),
+          config_(config),
+          percent_mp_(mp) {}
     virtual ~MClient() {}
     virtual void GetTxn(TxnProto **txn, int txn_id)
     {
@@ -83,24 +86,23 @@ public:
         TPCCArgs args;
         args.set_system_time(GetTime());
         args.set_multipartition((rand() % 100) < percent_mp_);
-
         string args_string;
         args.SerializeToString(&args_string);
 
-        int random_txn_type = rand() % 100;
-        if (random_txn_type < 45)
+        int r = rand() % 100;
+        if (r < 45)
         {
             *txn = tpcc_->NewTxn(txn_id, TPCC::NEW_ORDER, args_string, config_);
         }
-        else if (random_txn_type < 88)
+        else if (r < 88)
         {
             *txn = tpcc_->NewTxn(txn_id, TPCC::PAYMENT, args_string, config_);
         }
-        else if (random_txn_type < 92)
+        else if (r < 92)
         {
             *txn = tpcc_->NewTxn(txn_id, TPCC::ORDER_STATUS, args_string, config_);
         }
-        else if (random_txn_type < 96)
+        else if (r < 96)
         {
             *txn = tpcc_->NewTxn(txn_id, TPCC::DELIVERY, args_string, config_);
         }
@@ -134,18 +136,15 @@ private:
     Application *ycsb_app_;
 };
 
-// シグナルハンドラ
-void stop(int sig)
-{
-    exit(sig);
-}
+// ---- signal ----
+void stop(int sig) { exit(sig); }
 
 int main(int argc, char **argv)
 {
-    // 引数チェックとシグナルハンドラ設定 (変更なし)
     if (argc < 4)
     {
-        fprintf(stderr, "Usage: %s <node-id> <m[icro]|t[pcc]|y[csb]> <percent_mp> [f for fetching]\n",
+        fprintf(stderr,
+                "Usage: %s <node-id> <m[icro]|t[pcc]|y[csb]> <percent_mp> [f for fetching]\n",
                 argv[0]);
         exit(1);
     }
@@ -153,12 +152,11 @@ int main(int argc, char **argv)
     signal(SIGINT, &stop);
     signal(SIGTERM, &stop);
 
-    // 設定とマルチプレクサの構築 (変更なし)
     Configuration config(StringToInt(argv[1]), "deploy-run.conf");
     ConnectionMultiplexer multiplexer(&config);
 
-    // ApplicationとClientの生成 (変更なし)
-    Application *application;
+    // ---- Application ----
+    Application *application = nullptr;
     if (argv[2][0] == 'm')
     {
         application = new Microbenchmark(config.all_nodes.size(), HOT);
@@ -181,7 +179,8 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    Client *client;
+    // ---- Client ----
+    Client *client = nullptr;
     if (argv[2][0] == 'm')
     {
         client = new MClient(&config, atoi(argv[3]), application);
@@ -195,11 +194,12 @@ int main(int argc, char **argv)
         client = new YClient(&config, atoi(argv[3]), application);
     }
 
-    // MutexとStorageの初期化 (変更なし)
+    // ---- Storage ----
     pthread_mutex_init(&mutex_, NULL);
     pthread_mutex_init(&mutex_for_item, NULL);
     involed_customers = new vector<Key>;
-    Storage *storage;
+
+    Storage *storage = nullptr;
     if (!useFetching)
     {
         storage = new SimpleStorage();
@@ -211,42 +211,35 @@ int main(int argc, char **argv)
     storage->Initmutex();
     application->InitializeStorage(storage, &config);
 
-    // ----------- ★★★ 修正箇所 ★★★ -----------
-    // R/W用と、複数のR/O用に通信路を生成する
-
-    // R/Wトランザクション用の通信路
+    // ---- Connections ----
     Connection *rw_connection = multiplexer.NewConnection("scheduler_");
-
-    // 複数のR/Oトランザクション用通信路を生成
     vector<Connection *> *ro_connections = new vector<Connection *>();
     for (int i = 0; i < NUM_RO_DISPATCHERS; i++)
     {
-        // 各Dispatcherがリッスンする一意のチャネル名を作成
         string channel_name = "ro_scheduler_" + IntToString(i);
         ro_connections->push_back(multiplexer.NewConnection(channel_name));
     }
 
-    // シーケンサコンポーネントの初期化と起動
-    Sequencer sequencer(&config, rw_connection, ro_connections, client, storage);
+    {
+        // ---- Sequencer & Scheduler ----
+        Sequencer sequencer(&config, rw_connection, ro_connections, client, storage);
+        DeterministicScheduler scheduler(&config,
+                                         rw_connection,
+                                         ro_connections,
+                                         storage,
+                                         application);
 
-    // スケジューラをメインスレッドで実行
-    DeterministicScheduler scheduler(&config,
-                                     rw_connection,
-                                     ro_connections,
-                                     storage,
-                                     application);
-    // -----------------------------------------
+        // Run for 180 seconds
+        Spin(180);
+        // <-- ここで scheduler, sequencer のデストラクタが走って join される
+    }
 
-    // 180秒間実行
-    Spin(180);
-
-    // メモリ解放
+    // ---- Clean up ----
     delete client;
     delete application;
     delete storage;
     delete involed_customers;
 
-    // ★★★ 追加：Connectionオブジェクトの解放 ★★★
     for (Connection *conn : *ro_connections)
     {
         delete conn;

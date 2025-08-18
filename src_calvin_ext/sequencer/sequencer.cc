@@ -133,8 +133,6 @@ void Sequencer::RunWriter()
 {
     PrintCpu("RunWriter", 0);
 
-    Spin(1);
-
 #ifdef PAXOS
     Paxos paxos(ZOOKEEPER_CONF, false);
 #endif
@@ -143,7 +141,7 @@ void Sequencer::RunWriter()
     multimap<double, TxnProto *> fetching_txns;
 #endif
 
-    // Synchronization loadgen start with other sequencers.
+    // === 同期（既存ロジック） ===
     MessageProto synchronization_message;
     synchronization_message.set_type(MessageProto::EMPTY);
     synchronization_message.set_destination_channel("sequencer");
@@ -166,81 +164,58 @@ void Sequencer::RunWriter()
     std::cout << "Starting sequencer.\n"
               << std::flush;
 
-    MessageProto batch;
-    batch.set_destination_channel("sequencer");
-    batch.set_destination_node(-1);
-    string batch_string;
-    batch.set_type(MessageProto::TXN_BATCH);
-
+    // === エポックループ ===
     for (int batch_number = configuration_->this_node_id; !deconstructor_invoked_;
          batch_number += configuration_->all_nodes.size())
     {
-        double epoch_start = GetTime();
-        batch.set_batch_number(batch_number);
-        batch.clear_data();
+        const double epoch_start = GetTime();
+
+        // バッチはポインタで構築（TXN_BATCH + data_ptr[*]）
+        MessageProto *batch = new MessageProto();
+        batch->set_type(MessageProto::TXN_BATCH);
+        batch->set_destination_channel("sequencer");
+        batch->set_destination_node(-1);
+        batch->set_batch_number(batch_number);
 
         int txn_id_offset = 0;
-        while (!deconstructor_invoked_ &&
-               GetTime() < epoch_start + epoch_duration_)
+        while (!deconstructor_invoked_ && GetTime() < epoch_start + epoch_duration_)
         {
-            if (batch.data_size() < MAX_LOCK_BATCH_SIZE)
+            if (batch->data_ptr_size() >= MAX_LOCK_BATCH_SIZE)
+                break;
+
+            TxnProto *txn = nullptr;
+            client_->GetTxn(&txn, batch_number * MAX_LOCK_BATCH_SIZE + txn_id_offset);
+
+            // ロードジェネレータが「空」を返す場合のスキップ
+            if (txn == nullptr || txn->txn_id() == -1)
             {
-                TxnProto *txn;
-                string txn_string;
-                client_->GetTxn(&txn,
-                                batch_number * MAX_LOCK_BATCH_SIZE + txn_id_offset);
-
-                if (txn->txn_id() == -1)
-                {
+                if (txn)
                     delete txn;
-                    continue;
-                }
-
-                // ここでタイムスタンプを設定
-                txn->set_sequencer_start_time(GetTime());
-
-                // トランザクションの中身を確認し、read_onlyフラグをSequencer自身が設定する
-                if (txn->write_set_size() == 0 && txn->read_write_set_size() == 0)
-                {
-                    txn->set_read_only(true);
-                }
-                else
-                {
-                    txn->set_read_only(false);
-                }
-
-                txn->SerializeToString(&txn_string);
-                batch.add_data(txn_string);
-                txn_id_offset++;
-                delete txn;
+                continue;
             }
+
+            // Sequencer 側で最小限の属性設定
+            txn->set_sequencer_start_time(GetTime());
+            txn->set_read_only(txn->write_set_size() == 0 && txn->read_write_set_size() == 0);
+
+            // シリアライズせず、生ポインタを data_ptr に積む（同一プロセス前提）
+            batch->add_data_ptr(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(txn)));
+            txn_id_offset++;
         }
 
-        batch.SerializeToString(&batch_string);
-#ifdef PAXOS
-        paxos.SubmitBatch(batch_string);
-#else
+        // 内部キューへ投入（RunReader 側で取り出し/分配）
         pthread_mutex_lock(&mutex_);
-        batch_queue_.push(batch_string);
+        batch_queue_.push(batch);
         pthread_mutex_unlock(&mutex_);
-#endif
     }
-
-    Spin(1);
 }
 
 void Sequencer::RunReader()
 {
     PrintCpu("RunReader", 0);
 
-    Spin(1);
-#ifdef PAXOS
-    Paxos paxos(ZOOKEEPER_CONF, true);
-#endif
-
     map<int, MessageProto> rw_batches;
-    for (map<int, Node *>::iterator it = configuration_->all_nodes.begin();
-         it != configuration_->all_nodes.end(); ++it)
+    for (auto it = configuration_->all_nodes.begin(); it != configuration_->all_nodes.end(); ++it)
     {
         rw_batches[it->first].set_destination_channel("scheduler_");
         rw_batches[it->first].set_destination_node(it->first);
@@ -249,26 +224,23 @@ void Sequencer::RunReader()
 
     uint64_t next_dispatcher = 0;
     double time = GetTime();
-    int txn_count = 0;
-    int batch_count = 0;
+    int txn_count = 0, batch_count = 0;
     int batch_number = configuration_->this_node_id;
     double total_ro_latency = 0.0;
     int ro_txn_count = 0;
 
     while (!deconstructor_invoked_)
     {
-        string batch_string;
-        MessageProto batch_message;
-#ifdef PAXOS
-        paxos.GetNextBatchBlocking(&batch_string);
-#else
+        MessageProto *batch_message = nullptr;
+
+        // ★ 文字列でなく MessageProto* を取り出す
         bool got_batch = false;
         do
         {
             pthread_mutex_lock(&mutex_);
-            if (batch_queue_.size())
+            if (!batch_queue_.empty())
             {
-                batch_string = batch_queue_.front();
+                batch_message = batch_queue_.front();
                 batch_queue_.pop();
                 got_batch = true;
             }
@@ -276,80 +248,79 @@ void Sequencer::RunReader()
             if (!got_batch)
                 Spin(0.001);
         } while (!got_batch);
-#endif
-        batch_message.ParseFromString(batch_string);
 
+        // ★ RO バッチは data_ptr で組み立てる
         MessageProto ro_batch_message;
         ro_batch_message.set_type(MessageProto::TXN_BATCH);
-
         string ro_channel_name = "ro_scheduler_" + IntToString(next_dispatcher);
         ro_batch_message.set_destination_channel(ro_channel_name);
         set<int> ro_dest_nodes;
 
-        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        // ★★★ ここにループの中身を正しく復元します ★★★
-        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        for (int i = 0; i < batch_message.data_size(); i++)
+        // ★ 各 TxnProto* を取り出し
+        for (int i = 0; i < batch_message->data_ptr_size(); i++)
         {
-            TxnProto txn;
-            txn.ParseFromString(batch_message.data(i));
+            auto raw = batch_message->data_ptr(i);
+            TxnProto *txn = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw));
 
-            set<int> readers;
-            set<int> writers;
-            for (int j = 0; j < txn.read_set_size(); j++)
-                readers.insert(configuration_->LookupPartition(txn.read_set(j)));
-            for (int j = 0; j < txn.write_set_size(); j++)
-                writers.insert(configuration_->LookupPartition(txn.write_set(j)));
-            for (int j = 0; j < txn.read_write_set_size(); j++)
+            set<int> readers, writers;
+            for (int j = 0; j < txn->read_set_size(); j++)
+                readers.insert(configuration_->LookupPartition(txn->read_set(j)));
+            for (int j = 0; j < txn->write_set_size(); j++)
+                writers.insert(configuration_->LookupPartition(txn->write_set(j)));
+            for (int j = 0; j < txn->read_write_set_size(); j++)
             {
-                writers.insert(configuration_->LookupPartition(txn.read_write_set(j)));
-                readers.insert(configuration_->LookupPartition(txn.read_write_set(j)));
+                auto p = configuration_->LookupPartition(txn->read_write_set(j));
+                writers.insert(p);
+                readers.insert(p);
             }
 
-            for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
-                txn.add_readers(*it);
-            for (set<int>::iterator it = writers.begin(); it != writers.end(); ++it)
-                txn.add_writers(*it);
+            for (int p : readers)
+                txn->add_readers(p);
+            for (int p : writers)
+                txn->add_writers(p);
 
-            bytes txn_data;
-            txn.SerializeToString(&txn_data);
-
-            if (txn.has_read_only() && txn.read_only())
+            if (txn->read_only())
             {
-                if (txn.has_sequencer_start_time())
+                if (txn->has_sequencer_start_time())
                 {
-                    double latency = GetTime() - txn.sequencer_start_time();
-                    total_ro_latency += latency;
+                    total_ro_latency += (GetTime() - txn->sequencer_start_time());
                     ro_txn_count++;
                 }
-                ro_batch_message.add_data(txn_data);
-                for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
-                {
-                    ro_dest_nodes.insert(*it);
-                }
+                // ★ pointer をそのまま中継（RO専用、同一プロセス前提）
+                ro_batch_message.add_data_ptr(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(txn)));
+                for (int p : readers)
+                    ro_dest_nodes.insert(p);
             }
             else
             {
-                for (set<int>::iterator it = writers.begin(); it != writers.end(); ++it)
-                    readers.insert(*it);
-                for (set<int>::iterator it = readers.begin(); it != readers.end(); ++it)
-                    rw_batches[*it].add_data(txn_data);
+                // ★ RW はネットワーク/Connection 経路なのでシリアライズに戻す
+                bytes txn_data;
+                txn->SerializeToString(&txn_data);
+                for (int p : writers)
+                    readers.insert(p); // 既存ロジック
+                for (int p : readers)
+                    rw_batches[p].add_data(txn_data);
+
+                // ★ RW はここで責務終了なので delete（RO は中継先で delete）
+                delete txn;
             }
+
             txn_count++;
         }
 
-        if (ro_batch_message.data_size() > 0)
+        // ★ RO の送信（同一プロセス内 Connection 前提。RO Dispatcher は data_ptr を読む実装に）
+        if (ro_batch_message.data_ptr_size() > 0)
         {
-            for (set<int>::iterator it = ro_dest_nodes.begin(); it != ro_dest_nodes.end(); ++it)
+            for (int node : ro_dest_nodes)
             {
-                ro_batch_message.set_destination_node(*it);
+                ro_batch_message.set_destination_node(node);
                 (*ro_connections_)[next_dispatcher]->Send(ro_batch_message);
             }
             next_dispatcher = (next_dispatcher + 1) % ro_connections_->size();
         }
 
-        for (map<int, MessageProto>::iterator it = rw_batches.begin();
-             it != rw_batches.end(); ++it)
+        // ★ RW の送信（従来通り bytes）
+        for (auto it = rw_batches.begin(); it != rw_batches.end(); ++it)
         {
             if (it->second.data_size() > 0)
             {
@@ -361,15 +332,17 @@ void Sequencer::RunReader()
         batch_number += configuration_->all_nodes.size();
         batch_count++;
 
+        // ★ 使用済みバッチメッセージを解放（中の Txn は RO のみ残っているが、これは下流で解放）
+        delete batch_message;
+
         if (GetTime() > time + 1)
         {
 #ifdef VERBOSE_SEQUENCER
-            std::cout << "Submitted " << txn_count << " txns in " << batch_count
-                      << " batches.\n";
+            std::cout << "Submitted " << txn_count << " txns in " << batch_count << " batches.\n";
             if (ro_txn_count > 0)
             {
-                double average_latency = total_ro_latency / ro_txn_count;
-                std::cout << "Average RO Txn Sequencer's latency for this epoch: " << average_latency << " seconds.\n";
+                double avg = total_ro_latency / ro_txn_count;
+                std::cout << "Average RO Txn Sequencer's latency for this epoch: " << avg << " seconds.\n";
             }
 #endif
             time = GetTime();
@@ -379,5 +352,4 @@ void Sequencer::RunReader()
             ro_txn_count = 0;
         }
     }
-    Spin(1);
 }

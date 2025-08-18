@@ -7,7 +7,7 @@
 #include <string>
 #include <queue>
 #include <vector> // ★ vectorを追加
-
+#include "proto/message.pb.h"
 #include "common/definitions.hh"
 
 using std::queue;
@@ -58,7 +58,7 @@ private:
     pthread_t writer_thread_;
     pthread_t reader_thread_;
     bool deconstructor_invoked_;
-    queue<string> batch_queue_;
+    queue<MessageProto *> batch_queue_;
     pthread_mutex_t mutex_;
 };
 #endif // _DB_SEQUENCER_SEQUENCER_H_

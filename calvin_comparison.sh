@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # --- 比較対象を設定 ('original' または 'proposed') ---
-TARGET="proposed" # ここを 'original' に変えて元カルバンを測定
+TARGET="original" # ここを 'original' に変えて元カルバンを測定
 
 # --- 引数処理 ---
 if [ "$1" == "m" ]; then
@@ -44,8 +44,8 @@ THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80)
 
 # <--- 変更点 No.1: 測定回数を60回に設定 ---
 RUN_DURATION=10
-NUM_RUNS=60
-WARMUP_RUNS=10
+NUM_RUNS=5
+WARMUP_RUNS=0
 
 # --- 基本設定 ---
 SCRIPT_DIR=$(dirname "$0")

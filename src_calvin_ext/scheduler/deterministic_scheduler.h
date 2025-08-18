@@ -54,6 +54,10 @@ public:
                            const Application *application);
 
     virtual ~DeterministicScheduler();
+    std::atomic<uint64_t> last_committed_batch_{0};
+    std::map<int, int> pending_rw_per_batch_;
+    int next_batch_to_commit_ = 0;
+    std::mutex pending_mu_;
 
 private:
     friend class MockDeterministicScheduler;
