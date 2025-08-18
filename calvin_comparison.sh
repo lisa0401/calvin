@@ -1,5 +1,3 @@
-
-
 #!/bin/bash
 
 # ==============================================================================
@@ -42,10 +40,12 @@ fi
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 # ★★★ ここを修正：96コアサーバー向けにテスト範囲を拡張 ★★★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80 88 92)
+THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80)
 
+# <--- 変更点 No.1: 測定回数を60回に設定 ---
 RUN_DURATION=10
-NUM_RUNS=5
+NUM_RUNS=60
+WARMUP_RUNS=10
 
 # --- 基本設定 ---
 SCRIPT_DIR=$(dirname "$0")
@@ -126,13 +126,16 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
 
         THROUGHPUT=$(grep -oP 'Completed\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
 
-        if [ -z "$THROUGHPUT" ]; then
-            echo "    - 実行 $i/$NUM_RUNS: ⚠️ スループット抽出失敗"
+        # <--- 変更点 No.2: 最初の10回は結果を保存しない ---
+        if [ "$i" -le "$WARMUP_RUNS" ]; then
+            echo "    - ウォームアップ実行 $i/$NUM_RUNS: 🚀 完了 (結果は破棄)"
+        elif [ -z "$THROUGHPUT" ]; then
+            echo "    - 測定実行 $i/$NUM_RUNS: ⚠️ スループット抽出失敗"
             FAILED_LOG_NAME="/tmp/failed_log_threads_${THREADS}_run_${i}.log"
             mv "$LOG_FILE" "$FAILED_LOG_NAME"
             echo "      (ログを ${FAILED_LOG_NAME} に保存しました)"
         else
-            echo "    - 実行 $i/$NUM_RUNS: ✅ スループット: $THROUGHPUT ops/sec"
+            echo "    - 測定実行 $i/$NUM_RUNS: ✅ スループット: $THROUGHPUT ops/sec"
             THROUGHPUT_ARRAY+=($THROUGHPUT)
         fi
         rm -f "$LOG_FILE"
@@ -140,19 +143,20 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
 
     # ========================== 結果集計 ==========================
     echo "  [4/4] 結果を集計中..."
-    SUCCESSFUL_RUNS=${#THROUGHPUT_ARRAY[@]}
-    if [ "$SUCCESSFUL_RUNS" -gt 1 ]; then
-        # 最初の1回をスキップ
+    # <--- 変更点 No.3: 集計ロジックを修正 ---
+    NUM_VALID_RUNS=${#THROUGHPUT_ARRAY[@]}
+    if [ "$NUM_VALID_RUNS" -gt 0 ]; then
+        # 配列内のすべての有効なスループットを合計する
         TOTAL_THROUGHPUT=0
-        for ((j=1; j<SUCCESSFUL_RUNS; j++)); do
-            TOTAL_THROUGHPUT=$(awk "BEGIN {print $TOTAL_THROUGHPUT + ${THROUGHPUT_ARRAY[$j]}}")
+        for t in "${THROUGHPUT_ARRAY[@]}"; do
+            TOTAL_THROUGHPUT=$(awk "BEGIN {print $TOTAL_THROUGHPUT + $t}")
         done
-        NUM_VALID_RUNS=$((SUCCESSFUL_RUNS - 1))
+        
         AVERAGE_THROUGHPUT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_THROUGHPUT / $NUM_VALID_RUNS}")
-        echo "✅ 平均スループット ($THREADS threads): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行)"
+        echo "✅ 平均スループット ($THREADS threads): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行から算出)"
     else
         AVERAGE_THROUGHPUT="N/A"
-        echo "⚠️  $THREADS threads の有効な実行が1回以下だったため、平均を計算できませんでした。"
+        echo "⚠️  $THREADS threads の有効な実行がなかったため、平均を計算できませんでした。"
     fi
     echo "$THREADS,$AVERAGE_THROUGHPUT" >> "$OUTPUT_CSV"
 done
