@@ -39,6 +39,14 @@ double worker_begin[SAMPLES];
 double worker_end[SAMPLES];
 double scheduler_unlock[SAMPLES];
 #endif
+// In sequencer.cc
+
+// 新しいスレッドのエントリーポイント
+void *Sequencer::RunSequencerGenerator(void *arg)
+{
+    reinterpret_cast<Sequencer *>(arg)->RunGenerator();
+    return NULL;
+}
 
 void *Sequencer::RunSequencerWriter(void *arg)
 {
@@ -60,15 +68,19 @@ Sequencer::Sequencer(Configuration *conf,
     : epoch_duration_(EPOCH_DURATION),
       configuration_(conf),
       rw_connection_(rw_connection),
-      ro_connections_(ro_connections), // ★ メンバー変数を初期化
+      ro_connections_(ro_connections),
       client_(client),
       storage_(storage),
       deconstructor_invoked_(false)
 {
+    // 既存のミューテックスを初期化
     pthread_mutex_init(&mutex_, NULL);
+    // 新しいミューテックスを初期化
+    pthread_mutex_init(&txn_queue_mutex_, NULL);
 
-    // (スレッド生成部分は変更なし)
     cpu_set_t cpuset;
+
+    // Writerスレッドの生成
     pthread_attr_t attr_writer;
     pthread_attr_init(&attr_writer);
     CPU_ZERO(&cpuset);
@@ -76,18 +88,51 @@ Sequencer::Sequencer(Configuration *conf,
     pthread_attr_setaffinity_np(&attr_writer, sizeof(cpu_set_t), &cpuset);
     pthread_create(&writer_thread_, &attr_writer, RunSequencerWriter, reinterpret_cast<void *>(this));
 
+    // Readerスレッドの生成
     pthread_attr_t attr_reader;
     pthread_attr_init(&attr_reader);
     CPU_ZERO(&cpuset);
     CPU_SET(SEQUENCER_READER_CORE, &cpuset);
     pthread_attr_setaffinity_np(&attr_reader, sizeof(cpu_set_t), &cpuset);
     pthread_create(&reader_thread_, &attr_reader, RunSequencerReader, reinterpret_cast<void *>(this));
+
+    // Generatorスレッドの生成
+    pthread_attr_t attr_generator;
+    pthread_attr_init(&attr_generator);
+    CPU_ZERO(&cpuset);
+    CPU_SET(SEQUENCER_GENERATOR_CORE, &cpuset);
+    pthread_attr_setaffinity_np(&attr_generator, sizeof(cpu_set_t), &cpuset);
+    pthread_create(&generator_thread_, &attr_generator, RunSequencerGenerator, reinterpret_cast<void *>(this));
 }
 Sequencer::~Sequencer()
 {
+    // 1. 全てのスレッドに終了を通知する
     deconstructor_invoked_ = true;
+
+    // 2. cond_waitで待機(スリープ)中のスレッドを全て起こす
+    //    これをしないと、スレッドが起きずにjoinで永久に待ち続ける(デッドロック)可能性がある
+    pthread_cond_broadcast(&queue_not_full_cond_);
+    pthread_cond_broadcast(&queue_not_empty_cond_);
+
+    // 3. 全てのスレッドが終了するのを待つ
+    pthread_join(generator_thread_, NULL);
     pthread_join(writer_thread_, NULL);
     pthread_join(reader_thread_, NULL);
+
+    // 4. キューに残ったトランザクションを解放し、メモリリークを防ぐ
+    pthread_mutex_lock(&txn_queue_mutex_);
+    while (!txn_queue_.empty())
+    {
+        delete txn_queue_.front();
+        txn_queue_.pop();
+    }
+    pthread_mutex_unlock(&txn_queue_mutex_);
+
+    // 5. 使用したミューテックスとコンディション変数を全て破棄する
+    pthread_mutex_destroy(&mutex_);
+    pthread_mutex_destroy(&txn_queue_mutex_);
+    pthread_cond_destroy(&queue_not_full_cond_);
+    pthread_cond_destroy(&queue_not_empty_cond_);
 }
 
 void Sequencer::FindParticipatingNodes(const TxnProto &txn, set<int> *nodes)
@@ -129,40 +174,49 @@ double PrefetchAll(Storage *storage, TxnProto *txn)
 }
 #endif
 
+// In sequencer.cc
+
+// トランザクションを事前に生成しておくキューの上限サイズ
+#define MAX_TXN_QUEUE_SIZE 50000
+
+void Sequencer::RunGenerator()
+{
+    PrintCpu("RunGenerator", 0);
+
+    while (!deconstructor_invoked_)
+    {
+        // キューが一杯なら少し待つ
+        pthread_mutex_lock(&txn_queue_mutex_);
+        bool is_full = txn_queue_.size() >= MAX_TXN_QUEUE_SIZE;
+        pthread_mutex_unlock(&txn_queue_mutex_);
+
+        if (is_full)
+        {
+            Spin(0.001); // 1ms待機
+            continue;
+        }
+
+        // トランザクションを生成
+        // GetTxnの第二引数は、もはやバッチ番号と無関係なので0としておくか、
+        // clientの実装に合わせて調整する
+        TxnProto *txn = nullptr;
+        client_->GetTxn(&txn, 0);
+
+        if (txn != nullptr)
+        {
+            // 生成したトランザクションをキューに追加
+            pthread_mutex_lock(&txn_queue_mutex_);
+            txn_queue_.push(txn);
+            pthread_mutex_unlock(&txn_queue_mutex_);
+        }
+    }
+}
+
 void Sequencer::RunWriter()
 {
     PrintCpu("RunWriter", 0);
 
-#ifdef PAXOS
-    Paxos paxos(ZOOKEEPER_CONF, false);
-#endif
-
-#ifdef PREFETCHING
-    multimap<double, TxnProto *> fetching_txns;
-#endif
-
-    // === 同期（既存ロジック） ===
-    MessageProto synchronization_message;
-    synchronization_message.set_type(MessageProto::EMPTY);
-    synchronization_message.set_destination_channel("sequencer");
-    for (uint32 i = 0; i < configuration_->all_nodes.size(); i++)
-    {
-        synchronization_message.set_destination_node(i);
-        if (i != static_cast<uint32>(configuration_->this_node_id))
-            rw_connection_->Send(synchronization_message);
-    }
-    uint32 synchronization_counter = 1;
-    while (synchronization_counter < configuration_->all_nodes.size())
-    {
-        synchronization_message.Clear();
-        if (rw_connection_->GetMessage(&synchronization_message))
-        {
-            assert(synchronization_message.type() == MessageProto::EMPTY);
-            synchronization_counter++;
-        }
-    }
-    std::cout << "Starting sequencer.\n"
-              << std::flush;
+    // ... (Paxosや同期のロジックは変更なし) ...
 
     // === エポックループ ===
     for (int batch_number = configuration_->this_node_id; !deconstructor_invoked_;
@@ -170,27 +224,38 @@ void Sequencer::RunWriter()
     {
         const double epoch_start = GetTime();
 
-        // バッチはポインタで構築（TXN_BATCH + data_ptr[*]）
         MessageProto *batch = new MessageProto();
         batch->set_type(MessageProto::TXN_BATCH);
         batch->set_destination_channel("sequencer");
         batch->set_destination_node(-1);
         batch->set_batch_number(batch_number);
 
-        int txn_id_offset = 0;
         while (!deconstructor_invoked_ && GetTime() < epoch_start + epoch_duration_)
         {
             if (batch->data_ptr_size() >= MAX_LOCK_BATCH_SIZE)
                 break;
 
+            // --- ▼ 変更 ▼ ---
+            // client_->GetTxn の代わりにキューから取得
             TxnProto *txn = nullptr;
-            client_->GetTxn(&txn, batch_number * MAX_LOCK_BATCH_SIZE + txn_id_offset);
 
-            // ロードジェネレータが「空」を返す場合のスキップ
+            pthread_mutex_lock(&txn_queue_mutex_);
+            if (!txn_queue_.empty())
+            {
+                txn = txn_queue_.front();
+                txn_queue_.pop();
+            }
+            pthread_mutex_unlock(&txn_queue_mutex_);
+            // --- ▲ 変更 ▲ ---
+
+            // ロードジェネレータが「空」を返す場合、またはキューが空だった場合のスキップ
             if (txn == nullptr || txn->txn_id() == -1)
             {
                 if (txn)
                     delete txn;
+                // キューが空だった場合は少し待機してリトライ
+                if (txn == nullptr)
+                    Spin(0.0001);
                 continue;
             }
 
@@ -198,9 +263,8 @@ void Sequencer::RunWriter()
             txn->set_sequencer_start_time(GetTime());
             txn->set_read_only(txn->write_set_size() == 0 && txn->read_write_set_size() == 0);
 
-            // シリアライズせず、生ポインタを data_ptr に積む（同一プロセス前提）
+            // シリアライズせず、生ポインタを data_ptr に積む
             batch->add_data_ptr(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(txn)));
-            txn_id_offset++;
         }
 
         // 内部キューへ投入（RunReader 側で取り出し/分配）

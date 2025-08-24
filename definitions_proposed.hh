@@ -23,7 +23,8 @@
 #define SEQUENCER_WRITER_CORE 3
 #define SEQUENCER_READER_CORE 5
 #define LOCK_MANAGER_CORE 7
-#define GET_RO_DISPATCHER_CORE(i) (9 + (i) * 2) // 続番の奇数コアを割り当て
+#define SEQUENCER_GENERATOR_CORE 9
+#define GET_RO_DISPATCHER_CORE(i) (11 + (i) * 2) // 続番の奇数コアを割り当て
 
 // --- ワーカーの定義 ---
 #define NUM_WORKERS_CORE (NUM_CORE - NUM_BACKGROUND_THREADS)

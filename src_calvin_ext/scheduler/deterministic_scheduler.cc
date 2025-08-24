@@ -9,7 +9,7 @@
 #include <map>
 #include <vector>
 #include <unistd.h> // usleep()のために追加
-
+#include <mutex>
 #include "applications/application.h"
 #include "common/utils.h"
 #include "common/zmq.hpp"
@@ -28,105 +28,88 @@ using std::string;
 using std::vector;
 using std::tr1::unordered_map;
 using zmq::socket_t;
-
+std::atomic<uint64_t> DeterministicScheduler::ro_rr_ticket_{0};
 static void DeleteTxnPtr(void *data, void *hint)
 {
     free(data);
 }
 
-// RODispatcherThread: SequencerからTxnProto*を直接受け取る修正版
+// RODispatcherThread: グローバル・ラウンドロビン版（高スキューでも均等配送）
 void *DeterministicScheduler::RODispatcherThread(void *arg)
 {
-    using PairT = pair<int, DeterministicScheduler *>;
+    using PairT = std::pair<int, DeterministicScheduler *>;
     PairT *args = reinterpret_cast<PairT *>(arg);
     const int dispatcher_id = args->first;
     DeterministicScheduler *scheduler = args->second;
-    delete args; // 引数用に確保されたメモリを解放
+    delete args;
 
     PrintCpu("RO Dispatcher", dispatcher_id);
-
-    // 受信バッチをワーカ別に一時集約
-    std::vector<std::vector<TxnProto *>> local_batches(NUM_WORKERS);
-
-    // ワーカ選択ロジック（変更なし）
-    auto choose_worker = [](const TxnProto &t) -> uint64_t
-    {
-        if (t.read_set_size() > 0)
-        {
-            const std::string k = t.read_set(0);
-            return static_cast<uint64_t>(std::hash<std::string>{}(k));
-        }
-        if (t.read_write_set_size() > 0)
-        {
-            const std::string k = t.read_write_set(0);
-            return static_cast<uint64_t>(std::hash<std::string>{}(k));
-        }
-        return static_cast<uint64_t>(t.txn_id());
-    };
 
     MessageProto message;
     while (true)
     {
-        // 自身のIDに対応するConnectionからメッセージを受信
-        if ((*scheduler->ro_connections_)[dispatcher_id]->GetMessage(&message))
-        {
-            assert(message.type() == MessageProto::TXN_BATCH);
-
-            // --- ① 仕分けフェーズ ---
-            const double batch_recv_time = GetTime();
-            const uint64_t snap_epoch = scheduler->last_committed_batch_.load(std::memory_order_acquire);
-            const int64_t snap_txnid =
-                static_cast<int64_t>(snap_epoch) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
-
-            // ★ 変更点 1: data_ptr_size() をループ条件にする
-            for (int i = 0; i < message.data_ptr_size(); i++)
-            {
-                // ★ 変更点 2: new/ParseFromString をやめ、ポインタを復元する
-                auto raw_ptr = message.data_ptr(i);
-                TxnProto *txn = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw_ptr));
-
-                // （計測）Dispatcher到着〜仕分けのタイムスタンプ
-                txn->set_time_sequencer_begin(batch_recv_time);
-                txn->set_time_sequencer_end(GetTime());
-
-                // RO 以外が紛れ込んでいたらスキップ（保護的に）
-                // ★ 変更点 3: ポインタを渡された側はdeleteしない。所有権はWorkerへ
-                if (!(txn->has_read_only() && txn->read_only()))
-                {
-                    // 本来ここに来ない想定。もし来た場合、このtxnのメモリ解放をどうするかは
-                    // システムの規約次第（捨てるならdelete、RW経路に回すならそのまま渡す）
-                    continue;
-                }
-
-                // ★ スナップショット境界を付与（これが SI の肝）★
-                txn->set_snapshot_epoch(snap_epoch);
-                txn->set_snapshot_txn_id(snap_txnid);
-
-                scheduler->executing_txns_++; // 実行中カウント（RO/RW共通）
-
-                // ワーカ決定（NUM_WORKERS で剰余）
-                uint64_t dest_worker = choose_worker(*txn) % NUM_WORKERS;
-                local_batches[dest_worker].push_back(txn);
-            }
-
-            // --- ② 一括投入フェーズ（変更なし） ---
-            for (uint64_t w = 0; w < NUM_WORKERS; ++w)
-            {
-                if (!local_batches[w].empty())
-                {
-                    std::lock_guard<std::mutex> lk(scheduler->worker_ro_queues_[w].m);
-                    auto &dq = scheduler->worker_ro_queues_[w].q;
-                    dq.insert(dq.end(), local_batches[w].begin(), local_batches[w].end());
-                    local_batches[w].clear();
-                }
-            }
-        }
-        else
+        if (!(*scheduler->ro_connections_)[dispatcher_id]->GetMessage(&message))
         {
             usleep(50);
+            continue;
+        }
+        assert(message.type() == MessageProto::TXN_BATCH);
+
+        const double batch_recv_time = GetTime();
+
+        // RO は「最新コミットの1つ前エポック」を読む
+        const uint64_t latest = scheduler->last_committed_batch_.load(std::memory_order_acquire);
+        const uint64_t snap_ep = (latest > 0) ? (latest - 1) : 0;
+        const int64_t snap_tx =
+            static_cast<int64_t>(snap_ep) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
+
+        const int n = message.data_ptr_size();
+
+        // RRチケットを “RO 件数” ぶんだけ消費したいので、まず RO 件数を数える
+        int ro_cnt = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            auto raw_ptr = message.data_ptr(i);
+            TxnProto *t = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw_ptr));
+            if (t->has_read_only() && t->read_only())
+                ++ro_cnt;
+        }
+        if (ro_cnt == 0)
+            continue;
+
+        // このバッチの RO 件数ぶんのチケットをまとめ取り
+        const uint64_t base = ro_rr_ticket_.fetch_add(ro_cnt, std::memory_order_relaxed);
+        uint64_t local = 0;
+
+        for (int i = 0; i < n; ++i)
+        {
+            auto raw_ptr = message.data_ptr(i);
+            TxnProto *txn = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw_ptr));
+
+            if (!(txn->has_read_only() && txn->read_only()))
+            {
+                // RW が紛れていても ASSERT しないで無視（RW は別経路で処理）
+                continue;
+            }
+
+            // 計測（Dispatcher 区間）
+            txn->set_time_sequencer_begin(batch_recv_time);
+            txn->set_time_sequencer_end(GetTime());
+
+            // スナップショット境界（前エポック）を付与
+            txn->set_snapshot_epoch(snap_ep);
+            txn->set_snapshot_txn_id(snap_tx);
+
+            scheduler->executing_txns_++;
+
+            // グローバル・ラウンドロビンで均等配送（スキュー無視でOK）
+            const uint64_t dest = (base + local) % NUM_WORKERS;
+            ++local;
+
+            scheduler->ro_queues_[dest]->Push(txn);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void DeterministicScheduler::SendTxnPtr(socket_t *socket, TxnProto *txn)
@@ -149,29 +132,33 @@ TxnProto *DeterministicScheduler::GetTxnPtr(socket_t *socket, zmq::message_t *ms
 // コンストラクタ: 複数のRO Connectionを受け取り、複数のDispatcherスレッドを生成
 DeterministicScheduler::DeterministicScheduler(Configuration *conf,
                                                Connection *rw_connection,
-                                               vector<Connection *> *ro_connections,
+                                               std::vector<Connection *> *ro_connections,
                                                Storage *storage,
                                                const Application *application)
     : configuration_(conf),
       rw_connection_(rw_connection),
       ro_connections_(ro_connections),
       storage_(storage),
-      application_(application),
-      executing_txns_(0),
-      worker_ro_queues_(NUM_WORKERS)
+      application_(application)
 {
+
     ready_txns_ = new std::deque<TxnProto *>();
     lock_manager_ = new DeterministicLockManager(ready_txns_, configuration_);
 
     rw_txns_queue_ = new AtomicQueue<TxnProto *>();
     done_queue = new AtomicQueue<TxnProto *>();
 
-    for (int i = 0; i < NUM_WORKERS; i++)
+    for (int i = 0; i < NUM_WORKERS; ++i)
     {
         message_queues[i] = new AtomicQueue<MessageProto>();
     }
+    // ★ ROロックフリーキューの生成
+    for (int i = 0; i < NUM_WORKERS; ++i)
+    {
+        ro_queues_[i] = new AtomicQueue<TxnProto *>();
+    }
 
-    // (測定用変数の初期化は変更なし)
+    // 計測の初期値（atomic はデフォルト0だが明示）
     total_ro_dispatch_time_ = 0;
     total_ro_queueing_time_ = 0;
     total_ro_worker_time_ = 0;
@@ -181,12 +168,12 @@ DeterministicScheduler::DeterministicScheduler(Configuration *conf,
     total_worker_time_ = 0;
     processed_rwt_count_ = 0;
 
-    Spin(1);
+    Spin(1); // 既存の小休止
 
     cpu_set_t cpuset;
 
-    // 複数のRODispatcherスレッドを生成
-    for (int i = 0; i < NUM_RO_DISPATCHERS; i++)
+    // === RO Dispatcher スレッド ===
+    for (int i = 0; i < NUM_RO_DISPATCHERS; ++i)
     {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -194,30 +181,39 @@ DeterministicScheduler::DeterministicScheduler(Configuration *conf,
         CPU_SET(GET_RO_DISPATCHER_CORE(i), &cpuset);
         pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
 
-        pair<int, DeterministicScheduler *> *arg = new pair<int, DeterministicScheduler *>(i, this);
-        pthread_create(&(ro_dispatcher_threads_[i]), &attr, RODispatcherThread, reinterpret_cast<void *>(arg));
+        std::pair<int, DeterministicScheduler *> *arg =
+            new std::pair<int, DeterministicScheduler *>(i, this);
+        pthread_create(&(ro_dispatcher_threads_[i]), &attr,
+                       RODispatcherThread, reinterpret_cast<void *>(arg));
     }
 
-    // LockManagerスレッド生成 (変更なし)
-    pthread_attr_t attr_lock_manager;
-    pthread_attr_init(&attr_lock_manager);
-    CPU_ZERO(&cpuset);
-    CPU_SET(LOCK_MANAGER_CORE, &cpuset);
-    pthread_attr_setaffinity_np(&attr_lock_manager, sizeof(cpu_set_t), &cpuset);
-    pthread_create(&lock_manager_thread_, &attr_lock_manager, LockManagerThread, reinterpret_cast<void *>(this));
-
-    // Workerスレッド生成 (変更なし)
-    for (int i = 0; i < NUM_WORKERS; i++)
+    // === Lock Manager スレッド ===
     {
-        string channel("scheduler");
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        CPU_ZERO(&cpuset);
+        CPU_SET(LOCK_MANAGER_CORE, &cpuset);
+        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+        pthread_create(&lock_manager_thread_, &attr,
+                       LockManagerThread, reinterpret_cast<void *>(this));
+    }
+
+    // === Worker スレッド ===
+    for (int i = 0; i < NUM_WORKERS; ++i)
+    {
+        std::string channel("scheduler");
         channel.append(IntToString(i));
-        thread_connections_[i] = rw_connection_->multiplexer()->NewConnection(channel, &message_queues[i]);
+        thread_connections_[i] =
+            rw_connection_->multiplexer()->NewConnection(channel, &message_queues[i]);
+
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         CPU_ZERO(&cpuset);
         CPU_SET(GET_WORKER_CORE(i), &cpuset);
         pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
-        pthread_create(&(threads_[i]), &attr, RunWorkerThread, reinterpret_cast<void *>(new pair<int, DeterministicScheduler *>(i, this)));
+
+        pthread_create(&(threads_[i]), &attr, RunWorkerThread,
+                       reinterpret_cast<void *>(new std::pair<int, DeterministicScheduler *>(i, this)));
     }
 }
 
@@ -231,23 +227,24 @@ DeterministicScheduler::~DeterministicScheduler()
     {
         delete message_queues[i];
     }
+    // ★ 追加: ROキューの破棄
+    for (int i = 0; i < NUM_WORKERS; i++)
+    {
+        delete ro_queues_[i];
+    }
 }
 
 // RunWorkerThread (最終修正版)
 
 void *DeterministicScheduler::RunWorkerThread(void *arg)
 {
-    // ----- 初期化 -----
-    typedef std::pair<int, DeterministicScheduler *> pair_t;
+    using pair_t = std::pair<int, DeterministicScheduler *>;
     pair_t *args_pair = reinterpret_cast<pair_t *>(arg);
     const int thread_id = args_pair->first;
     DeterministicScheduler *scheduler = args_pair->second;
     delete args_pair;
 
-    // RW ワーカーの本数（必要に応じて調整可）
-    const int NUM_RW_WORKERS = 1;
-    const bool is_rw_worker = (thread_id < NUM_RW_WORKERS);
-
+    // RW/RO 共通ワーカー。最初に RW キューを確認し、その後 RO を見る。
     std::tr1::unordered_map<std::string, StorageManager *> active_txns;
     PrintCpu("Worker", thread_id);
 
@@ -262,11 +259,10 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
             assert(message.type() == MessageProto::READ_RESULT);
             const std::string &chan = message.destination_channel();
             StorageManager *manager = NULL;
-            {
-                std::tr1::unordered_map<std::string, StorageManager *>::iterator it = active_txns.find(chan);
-                if (it != active_txns.end())
-                    manager = it->second;
-            }
+            auto it = active_txns.find(chan);
+            if (it != active_txns.end())
+                manager = it->second;
+
             if (manager)
             {
                 manager->HandleReadResult(message);
@@ -289,32 +285,17 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
         // =====================================================
         TxnProto *txn = NULL;
 
-        // 2-1) RW キュー（RW ワーカーのみ）
-        if (is_rw_worker)
+        // 2-1) まず RW キュー（非ブロッキング）
+        if (!scheduler->rw_txns_queue_->Pop(&txn))
         {
-            (void)scheduler->rw_txns_queue_->Pop(&txn);
-        }
-        // 2-2) 自分の RO キュー
-        if (txn == NULL)
-        {
-            std::lock_guard<std::mutex> lk(scheduler->worker_ro_queues_[thread_id].m);
-            if (!scheduler->worker_ro_queues_[thread_id].q.empty())
+            // 2-2) 取れなければ自分の RO キュー
+            if (!scheduler->ro_queues_[thread_id]->Pop(&txn))
             {
-                txn = scheduler->worker_ro_queues_[thread_id].q.back();
-                scheduler->worker_ro_queues_[thread_id].q.pop_back();
-            }
-        }
-        // 2-3) ワークスティーリング
-        if (txn == NULL)
-        {
-            int victim_id = rand() % NUM_WORKERS;
-            if (victim_id != thread_id)
-            {
-                std::unique_lock<std::mutex> lk(scheduler->worker_ro_queues_[victim_id].m, std::try_to_lock);
-                if (lk.owns_lock() && !scheduler->worker_ro_queues_[victim_id].q.empty())
+                // 2-3) それでも無ければスティール（別ワーカの RO キュー）
+                int victim_id = rand() % NUM_WORKERS;
+                if (victim_id != thread_id)
                 {
-                    txn = scheduler->worker_ro_queues_[victim_id].q.front();
-                    scheduler->worker_ro_queues_[victim_id].q.pop_front();
+                    (void)scheduler->ro_queues_[victim_id]->Pop(&txn);
                 }
             }
         }
@@ -333,16 +314,19 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
 
         if (txn->read_only())
         {
-            // -------- RO 高速パス：コミット済みスナップショットを読む --------
-            // snapshot_txn_id が付与されていればそれを使用。無ければ last_committed_batch_ から計算。
-            int64_t snap_txn =
+            // -------- RO 高速パス：スナップショット（前エポック）を読む --------
+            const int64_t snap_txn =
                 txn->has_snapshot_txn_id()
                     ? txn->snapshot_txn_id()
-                    : (int64_t)scheduler->last_committed_batch_.load(std::memory_order_acquire) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
+                    : (static_cast<int64_t>(
+                           std::max<uint64_t>(
+                               scheduler->last_committed_batch_.load(std::memory_order_acquire), 1ULL) -
+                           1ULL) *
+                           MAX_LOCK_BATCH_SIZE +
+                       (MAX_LOCK_BATCH_SIZE - 1));
 
             for (int i = 0; i < txn->read_set_size(); ++i)
             {
-                // CollapsedVersionedStorage::ReadObject(key, txn_id) を利用（戻り値は未使用でOK）
                 (void)scheduler->storage_->ReadObject(txn->read_set(i), snap_txn);
             }
             for (int i = 0; i < txn->read_write_set_size(); ++i)
@@ -355,7 +339,7 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
             continue;
         }
 
-        // -------- RW 従来パス（ロック取得 → 非同期 Read → 実行）--------
+        // -------- RW 従来パス（ロック取得済: ready→rw_txns_queue_ から来たもの）--------
         StorageManager *manager = new StorageManager(
             scheduler->configuration_, scheduler->thread_connections_[thread_id],
             scheduler->storage_, txn);
@@ -369,7 +353,7 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
         }
         else
         {
-            // 非同期 Read 経路：後続の READ_RESULT 処理で回収
+            // 非同期 Read 経路：後続の READ_RESULT で続きが走る
             const std::string chan = IntToString(txn->txn_id());
             scheduler->thread_connections_[thread_id]->LinkChannel(chan);
             active_txns[chan] = manager;
@@ -417,6 +401,15 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
     {
         return static_cast<int>(txn_id / MAX_LOCK_BATCH_SIZE);
     };
+
+    // バッチBに対応するtxn_id上限(cut)を公開
+    auto PublishCutForBatch = [&](int B)
+    {
+        const int64 cut = static_cast<int64>(B) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
+        scheduler->storage_->PublishSnapshot(cut);
+    };
+
+    // バッチ確定: PublishSnapshot → last_committed_batch_ advance
     auto AdvanceCommittedPrefixLocked = [&]()
     {
         for (;;)
@@ -426,7 +419,12 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
             if (pending == 0)
             {
                 if (it != scheduler->pending_rw_per_batch_.end())
+                {
                     scheduler->pending_rw_per_batch_.erase(it);
+                }
+                // 先にスナップショットを前進（prev <- curr, curr をBのcutへ）
+                PublishCutForBatch(scheduler->next_batch_to_commit_);
+                // その後、latest（=last_committed_batch_）をBに更新
                 scheduler->last_committed_batch_.store(scheduler->next_batch_to_commit_, std::memory_order_release);
                 scheduler->next_batch_to_commit_++;
             }
@@ -445,36 +443,41 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
     int batch_offset = 0;
     int batch_number = 0;
 
-    // ★ 追加: NULL が続く時に退避するためのバックオフ
+    // RWが来ない期間のバックオフ
     int empty_poll_streak = 0;
-    const int kBackoffFloorUs = 200; // 最小スリープ
-    const int kBackoffCeilUs = 5000; // 最大スリープ
+    const int kBackoffFloorUs = 200;
+    const int kBackoffCeilUs = 5000;
 
     while (true)
     {
+        // -------------------------------------------------
+        // 1) ワーカー完了キューから回収
+        // -------------------------------------------------
         TxnProto *done_txn;
         bool got_it = scheduler->done_queue->Pop(&done_txn);
         if (got_it)
         {
-            empty_poll_streak = 0; // 仕事が来たのでリセット
+            empty_poll_streak = 0;
 
             if (done_txn->has_read_only() && done_txn->read_only())
             {
+                // RO のメトリクス集計
                 if (done_txn->has_time_sequencer_begin())
                 {
-                    double dispatch_time = done_txn->time_sequencer_end() - done_txn->time_sequencer_begin();
+                    double d = done_txn->time_sequencer_end() - done_txn->time_sequencer_begin();
+                    double q = done_txn->time_worker_begin() - done_txn->time_sequencer_end();
+                    double w = done_txn->time_worker_end() - done_txn->time_worker_begin();
+
                     double cur = scheduler->total_ro_dispatch_time_.load();
-                    while (!scheduler->total_ro_dispatch_time_.compare_exchange_weak(cur, cur + dispatch_time))
+                    while (!scheduler->total_ro_dispatch_time_.compare_exchange_weak(cur, cur + d))
                     {
                     }
-                    double q_time = done_txn->time_worker_begin() - done_txn->time_sequencer_end();
                     cur = scheduler->total_ro_queueing_time_.load();
-                    while (!scheduler->total_ro_queueing_time_.compare_exchange_weak(cur, cur + q_time))
+                    while (!scheduler->total_ro_queueing_time_.compare_exchange_weak(cur, cur + q))
                     {
                     }
-                    double w_time = done_txn->time_worker_end() - done_txn->time_worker_begin();
                     cur = scheduler->total_ro_worker_time_.load();
-                    while (!scheduler->total_ro_worker_time_.compare_exchange_weak(cur, cur + w_time))
+                    while (!scheduler->total_ro_worker_time_.compare_exchange_weak(cur, cur + w))
                     {
                     }
                     scheduler->processed_rot_count_++;
@@ -482,6 +485,7 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
             }
             else
             {
+                // RW のロック解放とコミット前進
                 scheduler->lock_manager_->Release(done_txn);
                 {
                     std::lock_guard<std::mutex> lk(scheduler->pending_mu_);
@@ -489,21 +493,25 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
                     auto it = scheduler->pending_rw_per_batch_.find(B);
                     if (it != scheduler->pending_rw_per_batch_.end() && --(it->second) < 0)
                         it->second = 0;
+                    // ここでバッチ確定 → スナップショット公開 → latest更新
                     AdvanceCommittedPrefixLocked();
                 }
+
+                // RW のメトリクス集計
                 if (done_txn->has_time_sequencer_begin())
                 {
                     double seq = done_txn->time_sequencer_end() - done_txn->time_sequencer_begin();
+                    double q = done_txn->time_worker_begin() - done_txn->time_sequencer_end();
+                    double w = done_txn->time_worker_end() - done_txn->time_worker_begin();
+
                     double cur = scheduler->total_sequencer_time_.load();
                     while (!scheduler->total_sequencer_time_.compare_exchange_weak(cur, cur + seq))
                     {
                     }
-                    double q = done_txn->time_worker_begin() - done_txn->time_sequencer_end();
                     cur = scheduler->total_queueing_time_.load();
                     while (!scheduler->total_queueing_time_.compare_exchange_weak(cur, cur + q))
                     {
                     }
-                    double w = done_txn->time_worker_end() - done_txn->time_worker_begin();
                     cur = scheduler->total_worker_time_.load();
                     while (!scheduler->total_worker_time_.compare_exchange_weak(cur, cur + w))
                     {
@@ -513,25 +521,23 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
             }
 
             scheduler->executing_txns_--;
-            if (done_txn->writers_size() == 0 || rand() % done_txn->writers_size() == 0)
-                txns++;
+            // ★ 常にインクリメント（確率的カウントを廃止）
+            txns++;
             delete done_txn;
         }
         else
         {
-            // === ここから RW の取り込み ===
+            // -------------------------------------------------
+            // 2) Sequencer からRW取り込み（ロック要求→readyへ）
+            // -------------------------------------------------
             if (batch_message == NULL)
             {
                 batch_message = GetBatch(batch_number, scheduler->rw_connection_, &batches);
-
                 if (batch_message == NULL)
                 {
-                    // ★ 追加: RW が全く来ていない＝ROオンリー期の可能性 → バックオフ
                     empty_poll_streak = std::min(empty_poll_streak + 1, 1000000);
                     int sleep_us = std::min(kBackoffCeilUs, kBackoffFloorUs << std::min(empty_poll_streak, 8));
-                    // ただし ready_txns_ の排出があるかもしれないので短時間だけ寝る
                     usleep(sleep_us);
-                    // 以降の処理をスキップして while 先頭へ（スピン防止）
                     goto FLUSH_READY_AND_PRINT;
                 }
                 else
@@ -565,6 +571,7 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
                     std::lock_guard<std::mutex> lk(scheduler->pending_mu_);
                     (void)scheduler->pending_rw_per_batch_[B]; // 無ければ0で作る
                 }
+
                 for (int i = 0; i < LOCK_BATCH_SIZE; i++)
                 {
                     if (batch_offset >= batch_message->data_size())
@@ -581,17 +588,21 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
                     pending_txns++;
                     enqueued++;
                 }
+
                 if (enqueued > 0)
                 {
                     std::lock_guard<std::mutex> lk(scheduler->pending_mu_);
                     scheduler->pending_rw_per_batch_[B] += enqueued;
+                    // 取り込み後にも前進可能性あり（空バッチなど）
                     AdvanceCommittedPrefixLocked();
                 }
             }
         }
 
     FLUSH_READY_AND_PRINT:
-        // Ready な RW を実行キューへ
+        // -------------------------------------------------
+        // 3) Ready な RW を実行キューへ
+        // -------------------------------------------------
         while (!scheduler->ready_txns_->empty())
         {
             TxnProto *txn = scheduler->ready_txns_->front();
@@ -602,13 +613,21 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
             scheduler->rw_txns_queue_->Push(txn);
         }
 
+        // -------------------------------------------------
+        // 4) 1秒毎に進捗表示＆メトリクスリセット
+        // -------------------------------------------------
         if (GetTime() > time + 1)
         {
             double total_time = GetTime() - time;
+            double tps = (total_time > 0.0) ? (static_cast<double>(txns) / total_time) : 0.0;
+
             int current_executing = scheduler->executing_txns_.load();
-            std::cout << "Completed " << (static_cast<double>(txns) / total_time)
+            // 人間向け
+            std::cout << "Completed " << tps
                       << " txns/sec, " << current_executing
-                      << " executing, " << pending_txns << " pending\n"
+                      << " executing, " << pending_txns << " pending\n";
+            // スクリプト向け（必ず1行出す）
+            std::cout << "THROUGHPUT " << tps << "\n"
                       << std::flush;
 
             int processed_rwt = scheduler->processed_rwt_count_.load();
@@ -641,6 +660,7 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
                           << std::flush;
             }
 
+            // リセット
             time = GetTime();
             txns = 0;
             scheduler->processed_rwt_count_ = 0;
