@@ -15,7 +15,7 @@
 
 // --- バックグラウンドスレッドの定義 ---
 #define NUM_RO_DISPATCHERS 1 // スクリプトで上書きされる
-#define OTHER_BACKGROUND_THREADS 4
+#define OTHER_BACKGROUND_THREADS 5
 #define NUM_BACKGROUND_THREADS (OTHER_BACKGROUND_THREADS + NUM_RO_DISPATCHERS)
 
 // バックグラウンドスレッドをNode 1 (奇数コア) にハードコードで割り当て

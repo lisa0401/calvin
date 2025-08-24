@@ -37,7 +37,7 @@ if [ "$TARGET" == "original" ]; then
     SOURCE_DIR="src_calvin"
 else
     NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=4
+    OTHER_BACKGROUND_THREADS=5
     NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
     DEFINITIONS_FILE="definitions_proposed.hh"
     SOURCE_DIR="src_calvin_ext"
