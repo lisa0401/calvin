@@ -20,7 +20,7 @@ rm -rf src obj bin db db/storage db/checkpoints
 # OCC版のソースコードをビルド用のディレクトリにコピーします
 echo "Copying OCC source files..."
 cp -r src_calvin/ src
-cp definitions.hh src/common/definitions.hh
+cp definitions_original.hh src/common/definitions.hh
 
 # =========================
 # .proto ファイルのコンパイル

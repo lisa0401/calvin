@@ -1,1 +1,6 @@
 Threads,Average_Throughput(ops/sec)
+1,5274.40
+2,5400.76
+4,5368.24
+8,4092.98
+16,4048.24

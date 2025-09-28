@@ -11,6 +11,7 @@
 class Configuration;
 class Connection;
 class Storage;
+class Application;
 
 class SerialScheduler : public Scheduler {
  public:

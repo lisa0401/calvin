@@ -13,13 +13,8 @@
 
 #include "common/definitions.hh"
 
-// #define PAXOS
-// #define PREFETCHING
-
 #define SAMPLES 100000
 #define SAMPLE_RATE 999
-
-// #define LATENCY_TEST
 
 using std::queue;
 using std::set;
@@ -29,18 +24,8 @@ class Configuration;
 class Connection;
 class Storage;
 class TxnProto;
-
-#ifdef LATENCY_TEST
-extern double sequencer_recv[SAMPLES];
-// extern double paxos_begin[SAMPLES];
-// extern double paxos_end[SAMPLES];
-extern double sequencer_send[SAMPLES];
-extern double prefetch_cold[SAMPLES];
-extern double scheduler_lock[SAMPLES];
-extern double worker_begin[SAMPLES];
-extern double worker_end[SAMPLES];
-extern double scheduler_unlock[SAMPLES];
-#endif
+class Client;
+class Scheduler; // Schedulerクラスの前方宣言
 
 class Client {
  public:
@@ -50,66 +35,38 @@ class Client {
 
 class Sequencer {
  public:
-  // The constructor creates background threads and starts the Sequencer's main
-  // loops running.
   Sequencer(Configuration* conf,
             Connection* connection,
             Client* client,
-            Storage* storage);
-
-  // Halts the main loops.
+            Storage* storage,
+            Scheduler* scheduler);
   ~Sequencer();
 
  private:
-  // Sequencer's main loops:
-  //
-  // RunWriter:
-  //  while true:
-  //    Spend epoch_duration collecting client txn requests into a batch.
-  //    Send batch to Paxos service.
-  //
-  // RunReader:
-  //  while true:
-  //    Spend epoch_duration collecting client txn requests into a batch.
-  //
-  // Executes in a background thread created and started by the constructor.
-  void RunWriter();
-  void RunReader();
+  // Sequencer's main loops.
+  void Run();
+  void GeneratorLoop();
 
-  // Functions to start the Multiplexor's main loops, called in new pthreads by
-  // the Sequencer's constructor.
-  static void* RunSequencerWriter(void* arg);
-  static void* RunSequencerReader(void* arg);
+  // Functions to start the main loops, called in new pthreads.
+  static void* RunSequencer(void* arg);
+  static void* RunGenerator(void* arg);
 
-  // Sets '*nodes' to contain the node_id of every node participating in 'txn'.
   void FindParticipatingNodes(const TxnProto& txn, set<int>* nodes);
 
-  // Length of time spent collecting client requests before they are ordered,
-  // batched, and sent out to schedulers.
   double epoch_duration_;
-
-  // Configuration specifying node & system settings.
   Configuration* configuration_;
-
-  // Connection for sending and receiving protocol messages.
   Connection* connection_;
-
-  // Client from which to get incoming txns.
   Client* client_;
-
-  // Pointer to this node's storage object, for prefetching.
   Storage* storage_;
+  Scheduler* scheduler_;
 
-  // Separate pthread contexts in which to run the sequencer's main loops.
-  pthread_t writer_thread_;
-  pthread_t reader_thread_;
+  pthread_t sequencer_thread_;
+  pthread_t generator_thread_;
 
-  // False until the deconstructor is called. As soon as it is set to true, the
-  // main loop sees it and stops.
   bool deconstructor_invoked_;
-
-  // Queue for sending batches from writer to reader if not in paxos mode.
-  queue<string> batch_queue_;
-  pthread_mutex_t mutex_;
+  
+  queue<TxnProto*> txn_queue_;
+  pthread_mutex_t txn_queue_mutex_;
+  pthread_cond_t txn_queue_cond_;
 };
 #endif  // _DB_SEQUENCER_SEQUENCER_H_

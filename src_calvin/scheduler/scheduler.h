@@ -9,10 +9,13 @@
 #ifndef _DB_SCHEDULER_SCHEDULER_H_
 #define _DB_SCHEDULER_SCHEDULER_H_
 
-class Application;
+class TxnProto; // Forward declaration
 
 class Scheduler {
  public:
   virtual ~Scheduler() {}
+  // 純粋仮想関数としてPostTxnを定義
+  virtual void PostTxn(TxnProto* txn) = 0;
 };
+
 #endif  // _DB_SCHEDULER_SCHEDULER_H_

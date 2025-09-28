@@ -59,7 +59,7 @@ static uint64_t ZipfSample(Random &rnd, uint64_t n, double theta)
     return static_cast<uint64_t>(val);
 }
 
-// --- ▼▼▼ 以下が不足していました ▼▼▼ ---
+
 
 YCSB::YCSB(double read_ratio, double skew, uint64 db_size, uint64 hot_records)
     : read_ratio_(read_ratio),
@@ -124,7 +124,6 @@ int YCSB::Execute(TxnProto * /*txn*/, StorageManager * /*storage*/) const
     return 0;
 }
 
-// --- ▲▲▲ ここまでが不足していました ▲▲▲ ---
 
 void YCSB::GetRandomKeys(std::unordered_set<uint64> &keys, int num_keys, uint32 part) const
 {

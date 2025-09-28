@@ -3,7 +3,7 @@
 #ifndef _DB_SEQUENCER_SEQUENCER_H_
 #define _DB_SEQUENCER_SEQUENCER_H_
 
-#include <pthread.h> // pthread関連の型のために追加
+#include <pthread.h> // pthread関連
 #include <queue>
 #include <set>
 #include <string>
@@ -22,15 +22,13 @@ class Connection;
 class Storage;
 class TxnProto;
 
-class Client
-{
+class Client {
 public:
     virtual ~Client() {}
-    virtual void GetTxn(TxnProto **txn, int txn_id) = 0;
+    virtual void GetTxn(TxnProto **txn, uint64_t txn_id) = 0;
 };
 
-class Sequencer
-{
+class Sequencer {
 public:
     Sequencer(Configuration *conf, Connection *rw_connection,
               vector<Connection *> *ro_connections, Client *client,
@@ -40,13 +38,11 @@ public:
 
 private:
     // --- スレッド実行関数 ---
-    void RunWriter();
-    void RunReader();
+    void RunWriterReader();   // Writer + Reader を統合
     void RunGenerator();
 
     // --- スレッドのエントリーポイント (static) ---
-    static void *RunSequencerWriter(void *arg);
-    static void *RunSequencerReader(void *arg);
+    static void *RunSequencerWriterReader(void *arg);
     static void *RunSequencerGenerator(void *arg);
 
     void FindParticipatingNodes(const TxnProto &txn, set<int> *nodes);
@@ -62,21 +58,15 @@ private:
 
     // --- スレッドハンドル ---
     pthread_t writer_thread_;
-    pthread_t reader_thread_;
     pthread_t generator_thread_;
 
-    // --- 内部キュー (Writer -> Reader) ---
-    queue<MessageProto *> batch_queue_;
-    pthread_mutex_t mutex_; // batch_queue_用 mutex
-
-    // --- 内部キュー (Generator -> Writer) ---
+    // --- 内部キュー (Generator -> WriterReader) ---
     queue<TxnProto *> txn_queue_;
     pthread_mutex_t txn_queue_mutex_; // txn_queue_用 mutex
 
-    // --- ▼ 修正: コンディション変数を追加 ▼ ---
-    pthread_cond_t queue_not_full_cond_;  // キューが満杯でないことを通知
-    pthread_cond_t queue_not_empty_cond_; // キューが空でないことを通知
-    // --- ▲ 修正 ▲ ---
+    // --- コンディション変数 ---
+    pthread_cond_t queue_not_full_cond_;   // キューが満杯でないことを通知
+    pthread_cond_t queue_not_empty_cond_;  // キューが空でないことを通知
 };
 
 #endif // _DB_SEQUENCER_SEQUENCER_H_

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Calvin 比較実験用スクリプト (96コアサーバー向け)
+# Calvin 比較実験用スクリプト (72コアサーバー向け)
 # ==============================================================================
 
 # --- 比較対象を設定 ('original' または 'proposed') ---
@@ -38,19 +38,19 @@ else
 fi
 
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ★★★ ここを修正：96コアサーバー向けにテスト範囲を拡張 ★★★
+# ★★★ ここを修正：72コアサーバー向けにテスト範囲を拡張 ★★★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80)
+THREAD_COUNTS=(2 4 8 16 32 64)
 
 # <--- 変更点 No.1: 測定回数を60回に設定 ---
 RUN_DURATION=10
-NUM_RUNS=5
+NUM_RUNS=4
 WARMUP_RUNS=0
 
 # --- 基本設定 ---
 SCRIPT_DIR=$(dirname "$0")
 cd "$SCRIPT_DIR" || exit 1
-CONFIG_FILE="cygnus-run.conf"
+CONFIG_FILE="deploy-run.conf"
 BACKUP_CONFIG_FILE="${CONFIG_FILE}.bak"
 LOG_FILE="/tmp/calvin_output.log"
 
@@ -76,8 +76,8 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
     fi
     
     NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
-    if [ "$NUM_CORE" -gt 96 ]; then
-        echo "合計コア数($NUM_CORE)がサーバーの上限(96)を超えるためスキップします。"
+    if [ "$NUM_CORE" -gt 72 ]; then
+        echo "合計コア数($NUM_CORE)がサーバーの上限(72)を超えるためスキップします。"
         continue
     fi
     

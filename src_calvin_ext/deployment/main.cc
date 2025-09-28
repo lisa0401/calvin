@@ -52,7 +52,7 @@ public:
           config_(config),
           percent_mp_(mp) {}
     virtual ~MClient() {}
-    virtual void GetTxn(TxnProto **txn, int txn_id)
+    virtual void GetTxn(TxnProto **txn, uint64_t txn_id)
     {
         if (config_->all_nodes.size() > 1 && (rand() % 100) < percent_mp_)
         {
@@ -81,7 +81,7 @@ public:
     TClient(Configuration *config, int mp, Application *app)
         : config_(config), percent_mp_(mp), tpcc_(static_cast<TPCC *>(app)) {}
     virtual ~TClient() {}
-    virtual void GetTxn(TxnProto **txn, int txn_id)
+    virtual void GetTxn(TxnProto **txn, uint64_t txn_id)
     {
         TPCCArgs args;
         args.set_system_time(GetTime());
@@ -124,7 +124,7 @@ public:
     YClient(Configuration *config, int mp, Application *ycsb_app)
         : config_(config), percent_mp_(mp), ycsb_app_(ycsb_app) {}
     virtual ~YClient() {}
-    virtual void GetTxn(TxnProto **txn, int txn_id)
+    virtual void GetTxn(TxnProto **txn, uint64_t txn_id)
     {
         string args_string = "";
         *txn = ycsb_app_->NewTxn(txn_id, 0, args_string, config_);
@@ -249,3 +249,5 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
+

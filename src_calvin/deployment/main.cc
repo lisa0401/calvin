@@ -226,15 +226,15 @@ int main(int argc, char **argv)
     storage->Initmutex();
     application->InitializeStorage(storage, &config);
 
-    // シーケンサコンポーネントの初期化と起動
-    Sequencer sequencer(&config, multiplexer.NewConnection("sequencer"), client,
-                        storage);
-
-    // スケジューラをメインスレッドで実行
+    // ★ 修正点 1: スケジューラを先に生成します
     DeterministicScheduler scheduler(&config,
                                      multiplexer.NewConnection("scheduler_"),
                                      storage,
                                      application);
+
+    // ★ 修正点 2: Sequencerの5番目の引数に、生成したschedulerのアドレスを渡します
+    Sequencer sequencer(&config, multiplexer.NewConnection("sequencer"), client,
+                        storage, &scheduler);
 
     // 180秒間実行
     Spin(180);
