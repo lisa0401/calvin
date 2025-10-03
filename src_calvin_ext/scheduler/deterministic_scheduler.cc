@@ -57,10 +57,6 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
         assert(message.type() == MessageProto::TXN_BATCH);
 
         const double batch_recv_time = GetTime();
-        const uint64_t latest = scheduler->last_committed_batch_.load(std::memory_order_acquire);
-        const uint64_t snap_ep = (latest > 0) ? (latest - 1) : 0;
-        const int64_t snap_tx =
-            static_cast<int64_t>(snap_ep) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
 
         int ro_cnt = 0;
         for (int i = 0; i < message.data_ptr_size(); ++i) {
@@ -71,7 +67,7 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
         }
         if (ro_cnt == 0) continue;
 
-        const uint64_t base = ro_rr_ticket_.fetch_add(ro_cnt, std::memory_order_relaxed);
+        const uint64_t base = scheduler->ro_rr_ticket_.fetch_add(ro_cnt, std::memory_order_relaxed);
         uint64_t local = 0;
 
         for (int i = 0; i < message.data_ptr_size(); ++i)
@@ -83,6 +79,13 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
 
             txn->set_time_sequencer_begin(batch_recv_time);
             txn->set_time_sequencer_end(GetTime());
+
+            // ✅ txn の batch_number を基準に snapshot を決定
+            const uint64_t txn_batch = txn->batch_number();
+            const uint64_t snap_ep = (txn_batch > 0) ? (txn_batch - 1) : 0;
+            const int64_t snap_tx =
+                static_cast<int64_t>(snap_ep) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
+
             txn->set_snapshot_epoch(snap_ep);
             txn->set_snapshot_txn_id(snap_tx);
 
@@ -94,6 +97,7 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
     }
     return nullptr;
 }
+
 
 // Constructor for DeterministicScheduler
 DeterministicScheduler::DeterministicScheduler(Configuration *conf,

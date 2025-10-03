@@ -30,7 +30,7 @@ if [ "$TARGET" == "original" ]; then
 else
     # 提案手法 (Dispatcherは1つで実験する例)
     NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=5
+    OTHER_BACKGROUND_THREADS=4
     NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
     DEFINITIONS_FILE="definitions_proposed.hh"
     SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ

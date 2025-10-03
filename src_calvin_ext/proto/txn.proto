@@ -68,4 +68,7 @@ message TxnProto {
 
   // もしくは（あるいは併用）「commit_txn_id <= snapshot_txn_id の最新版を読む」
   optional int64  snapshot_txn_id  = 111;
+
+  optional int32 batch_number = 112;  // XX は未使用フィールド番号
+
 }

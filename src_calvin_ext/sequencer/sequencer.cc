@@ -232,7 +232,7 @@ void Sequencer::RunWriterReader() {
 
             TxnProto* txn = nullptr;
 
-            // Generator との1対1のProducer-Consumer
+            // Generator とのProducer-Consumer
             pthread_mutex_lock(&txn_queue_mutex_);
             while (txn_queue_.empty() && !deconstructor_invoked_) {
                 pthread_cond_wait(&queue_not_empty_cond_, &txn_queue_mutex_);
@@ -249,6 +249,9 @@ void Sequencer::RunWriterReader() {
 
             txn->set_sequencer_start_time(GetTime());
             txn->set_read_only(txn->write_set_size() == 0 && txn->read_write_set_size() == 0);
+
+            // ✅ txn にバッチナンバーを埋める
+            txn->set_batch_number(batch_number);
 
             // ====== Readerの役割（その場でRO/RWへ振り分け）======
             std::set<int> readers, writers;
@@ -282,7 +285,7 @@ void Sequencer::RunWriterReader() {
                 for (int p : participants) {
                     rw_batches[p].add_data_ptr(txn_ptr);
                 }
-                // 注意：txn の所有権は以後スケジューラ側へ（ここで delete しない）
+                // 注意：txn の所有権は以後スケジューラ側へ
             }
 
             batched++;
@@ -293,6 +296,7 @@ void Sequencer::RunWriterReader() {
 
         // ====== 送信：RO → 複数ノードへ複製配信 ======
         if (ro_batch_message.data_ptr_size() > 0) {
+            ro_batch_message.set_batch_number(batch_number);   // ROバッチにも番号付与
             for (int node : ro_dest_nodes) {
                 ro_batch_message.set_destination_node(node);
                 (*ro_connections_)[next_dispatcher]->Send(ro_batch_message);
