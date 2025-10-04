@@ -88,6 +88,7 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
 
             txn->set_snapshot_epoch(snap_ep);
             txn->set_snapshot_txn_id(snap_tx);
+            scheduler->storage_->PinEpoch(static_cast<int64>(snap_ep));
 
             scheduler->executing_txns_++;
             const uint64_t dest = (base + local) % NUM_WORKERS;
@@ -337,6 +338,9 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
         if (scheduler->done_queue->Pop(&done_txn)) {
             empty_poll_streak = 0;
             if (done_txn->read_only()) {
+                if (done_txn->has_snapshot_epoch()) {
+                    scheduler->storage_->UnpinEpoch(done_txn->snapshot_epoch());
+                }
                 if (done_txn->has_time_sequencer_begin()) {
                     double d = done_txn->time_sequencer_end() - done_txn->time_sequencer_begin();
                     double q = done_txn->time_worker_begin() - done_txn->time_sequencer_end();

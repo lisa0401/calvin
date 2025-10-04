@@ -45,6 +45,15 @@ public:
     virtual int Checkpoint() { return 0; }
     virtual void Initmutex() {}
     virtual void PublishSnapshot(int64 /*new_stable_txn_max*/) {}
+    // ===== multi-epoch 拡張（デフォルト no-op / 後方互換）=====
+    // RODispatcher で Pin、完了時に Unpin。SimpleStorage が override します。
+    virtual void   PinEpoch(int64 /*epoch*/) {}
+    virtual void   UnpinEpoch(int64 /*epoch*/) {}
+    // （任意）GCやバックプレッシャ用の問い合わせ/待機
+    virtual bool   CanRecycleUpTo(int64 /*epoch*/) const { return true; }
+    virtual void   WaitUntilNoReaders(int64 /*epoch*/) {}
+    // （任意）RO向け：epoch 指定読み。未実装ストレージでは nullptr を返すだけでもOK。
+    virtual Value* ReadObjectAtEpoch(const Key& /*key*/, int64 /*epoch*/) { return nullptr; }
 };
 
 #endif // _DB_BACKEND_STORAGE_H_
