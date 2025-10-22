@@ -23,7 +23,8 @@
 #define SEQUENCER_WRITER_CORE 3
 #define LOCK_MANAGER_CORE 5
 #define SEQUENCER_GENERATOR_CORE 7
-#define GET_RO_DISPATCHER_CORE(i) (11 + 2 * (i))
+#define SNAPSHOT_THREAD_CORE 11
+#define GET_RO_DISPATCHER_CORE(i) (13 + 2 * (i))
 
 
 // --- ワーカーの定義 ---

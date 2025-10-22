@@ -23,14 +23,15 @@ echo "🎯 測定対象: $TARGET"
 
 # ========================== 実験パラメータ ==========================
 if [ "$TARGET" == "original" ]; then
-    NUM_BACKGROUND=4
+    # --- 変更点: 'proposed' の OTHER_BACKGROUND_THREADS と合わせるため 5 に変更 ---
+    NUM_BACKGROUND=5
     DEFINITIONS_FILE="definitions_original.hh"
     SOURCE_DIR="src_calvin" # 元カルバンのソースディレクトリ
     OUTPUT_CSV="throughput_summary_${ARGUMENT}_original.csv"
 else
     # 提案手法 (Dispatcherは1つで実験する例)
     NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=4
+    OTHER_BACKGROUND_THREADS=5
     NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
     DEFINITIONS_FILE="definitions_proposed.hh"
     SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ
@@ -75,7 +76,11 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
         fi
     fi
     
+    # NUM_CORE の計算 (NUM_WORKERS + NUM_BACKGROUND)
+    # original の場合: THREADS + 5
+    # proposed の場合: (THREADS - 1) + (5 + 1) = THREADS + 5
     NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
+    
     if [ "$NUM_CORE" -gt 72 ]; then
         echo "合計コア数($NUM_CORE)がサーバーの上限(72)を超えるためスキップします。"
         continue

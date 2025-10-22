@@ -179,10 +179,7 @@ void* DeterministicScheduler::RunWorkerThread(void* arg) {
 
 DeterministicScheduler::~DeterministicScheduler() {}
 
-// ★ 変更点: GetBatch関数は不要になったため完全に削除
 
-// void* DeterministicScheduler::LockManagerThread(void* arg) { ... }
-// ★ 変更点: LockManagerThreadのロジックを全面的に書き換え
 void* DeterministicScheduler::LockManagerThread(void* arg) {
   PrintCpu("Lock Manager", 0);
 

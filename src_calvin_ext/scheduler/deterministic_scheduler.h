@@ -15,6 +15,11 @@
 #include "proto/txn.pb.h"
 #include "proto/message.pb.h"
 
+// ▼ 追加 ▼
+// SimpleStorage::SnapshotRequest* を使うためにインクルード
+#include "backend/simple_storage.h" 
+// ▲ 追加 ▲
+
 // （必要なら）ZeroMQ 前方宣言
 namespace zmq {
 class socket_t;
@@ -31,9 +36,9 @@ class TxnProto;
 
 /**
  * DeterministicScheduler
- *  - Sequencer から届く RW/RO Txn を受け取り、ロック取得・実行キュー投入・完了回収を担当。
- *  - RO は「自分の batch_number - 1 の epoch（スナップショット）」を読む前提。
- *  - multi-epoch Storage（PinEpoch/UnpinEpoch）と連携して、遅延ROがいても publish を止めずに前に進める。
+ * - Sequencer から届く RW/RO Txn を受け取り、ロック取得・実行キュー投入・完了回収を担当。
+ * - RO は「自分の batch_number - 1 の epoch（スナップショット）」を読む前提。
+ * - multi-epoch Storage（PinEpoch/UnpinEpoch）と連携して、遅延ROがいても publish を止めずに前に進める。
  */
 class DeterministicScheduler : public Scheduler {
 public:
@@ -59,6 +64,9 @@ private:
     static void* RunWorkerThread(void* arg);
     static void* LockManagerThread(void* arg);
     static void* RODispatcherThread(void* arg);
+    // ▼ 追加 ▼
+    static void* SnapshotThreadMain(void* arg); // スナップショット用スレッド
+    // ▲ 追加 ▲
 
     // ===================== ZMQユーティリティ（使うなら） =====================
     // ZMQ 経由で TxnProto* を送受信（使用しない構成なら未使用でOK）
@@ -66,11 +74,11 @@ private:
     TxnProto* GetTxnPtr(zmq::socket_t* socket, zmq::message_t* msg);
 
     // ===================== 構成 =====================
-    Configuration*            configuration_;
-    Connection*               rw_connection_;
+    Configuration* configuration_;
+    Connection* rw_connection_;
     std::vector<Connection*>* ro_connections_;
-    Storage*                  storage_;
-    const Application*        application_;
+    Storage* storage_;
+    const Application* application_;
 
     // 実行中トランザクション数（計測用）
     std::atomic<int> executing_txns_{0};
@@ -80,17 +88,26 @@ private:
     AtomicQueue<TxnProto*>* ro_queues_[NUM_WORKERS];
 
     // RWキュー / 完了キュー
-    std::deque<TxnProto*>*       ready_txns_;      // ロック獲得済みで実行待ちのRW
-    DeterministicLockManager*    lock_manager_;
-    AtomicQueue<TxnProto*>*      rw_txns_queue_;   // 実行ワーカーへ渡すRW
-    AtomicQueue<TxnProto*>*      done_queue;       // 完了通知（RO/RW共通）
-    AtomicQueue<MessageProto>*   message_queues[NUM_WORKERS];
-    Connection*                  thread_connections_[NUM_WORKERS];
+    std::deque<TxnProto*>* ready_txns_;      // ロック獲得済みで実行待ちのRW
+    DeterministicLockManager* lock_manager_;
+    AtomicQueue<TxnProto*>* rw_txns_queue_;   // 実行ワーカーへ渡すRW
+    AtomicQueue<TxnProto*>* done_queue;       // 完了通知（RO/RW共通）
+    AtomicQueue<MessageProto>* message_queues[NUM_WORKERS];
+    Connection* thread_connections_[NUM_WORKERS];
+
+    // ▼ 追加 ▼
+    // スナップショット要求を格納するキュー
+    AtomicQueue<SimpleStorage::SnapshotRequest*>* snapshot_queue_;
+    // ▲ 追加 ▲
+
 
     // ===================== スレッドハンドル =====================
     pthread_t threads_[NUM_WORKERS];
     pthread_t lock_manager_thread_;
     pthread_t ro_dispatcher_threads_[NUM_RO_DISPATCHERS];
+    // ▼ 追加 ▼
+    pthread_t snapshot_thread_; // スナップショット用スレッド
+    // ▲ 追加 ▲
 
     // ===================== 計測（RW） =====================
     std::atomic<double> total_sequencer_time_{0};

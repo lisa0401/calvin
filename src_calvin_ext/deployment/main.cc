@@ -167,10 +167,10 @@ int main(int argc, char **argv)
     }
     else if (argv[2][0] == 'y')
     {
-        const double read_ratio = 1.0;
-        const double skew = 0.99;
+        const double read_ratio = 0.80;
+        const double skew = 0.80;
         const uint64 db_size = DB_SIZE;
-        const uint64 hot_records = 10;
+        const uint64 hot_records = 1000;
         application = new YCSB(read_ratio, skew, db_size, hot_records);
     }
     else
