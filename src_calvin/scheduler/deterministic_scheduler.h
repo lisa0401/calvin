@@ -1,5 +1,5 @@
 // Author: Alexander Thomson (thomson@cs.yale.edu)
-// Author: Kun Ren (kun@cs.yale.edu)
+// Author: Kun Ren (kun.ren@yale.edu)
 //
 // The deterministic lock manager implements deterministic locking as described
 // in 'The Case for Determinism in Database Systems', VLDB 2010. Each
@@ -34,7 +34,6 @@ class Connection;
 class DeterministicLockManager;
 class Storage;
 class TxnProto;
-class Application;
 
 class DeterministicScheduler : public Scheduler {
  public:
@@ -52,9 +51,6 @@ class DeterministicScheduler : public Scheduler {
                          Storage* storage,
                          const Application* application);
   virtual ~DeterministicScheduler();
-
-  // ★ Sequencerがトランザクションポインタを渡すための公開メソッド
-  void PostTxn(TxnProto* txn);
 
  private:
   // Function for starting main loops in a separate pthreads.
@@ -91,13 +87,15 @@ class DeterministicScheduler : public Scheduler {
   // they have requested.
   std::deque<TxnProto*>* ready_txns_;
 
-  // Queues for communication between main scheduler thread and worker threads.
+  // Sockets for communication between main scheduler thread and worker threads.
+  //  socket_t* requests_out_;
+  //  socket_t* requests_in_;
+  //  socket_t* responses_out_[NUM_WORKERS];
+  //  socket_t* responses_in_;
+
   AtomicQueue<TxnProto*>* txns_queue;
   AtomicQueue<TxnProto*>* done_queue;
-  AtomicQueue<MessageProto>* message_queues[NUM_WORKERS];
-  
-  // ★ Sequencerからのトランザクションを格納する新しいキュー
-  AtomicQueue<TxnProto*>* sequencer_input_queue_;
 
+  AtomicQueue<MessageProto>* message_queues[NUM_WORKERS];
 };
 #endif  // _DB_SCHEDULER_DETERMINISTIC_SCHEDULER_H_

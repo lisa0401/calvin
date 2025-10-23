@@ -17,9 +17,9 @@
 #define NUM_BACKGROUND_THREADS 4
 // バックグラウンドをNode 1 (奇数コア) にハードコードで割り当て
 #define MULTIPLEXER_CORE 1
-#define SEQUENCER_CORE 3
-#define LOCK_MANAGER_CORE 5
-#define SEQUENCER_GENERATOR_CORE 7
+#define SEQUENCER_WRITER_CORE 3
+#define SEQUENCER_READER_CORE 5
+#define LOCK_MANAGER_CORE 7
 
 // --- ワーカーの定義 ---
 // Node0 = 偶数CPUのみを使用（奇数CPUは常にBG専用）

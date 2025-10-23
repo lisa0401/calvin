@@ -29,9 +29,16 @@ echo "🎯 測定対象: $TARGET"
 SKEW_LEVELS=(0.0 0.2 0.4 0.6 0.8 1.0)
 
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ★★★ ここを修正：ワーカースレッド数を32に固定 ★★★
+# ★★★ ここを修正：基本となるワーカースレッド数 ★★★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-FIXED_NUM_WORKERS=32
+BASE_WORKERS=32
+
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★★★ ここを修正：提案手法の追加スレッド設定 ★★★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+NUM_DISPATCHERS_PROPOSED=1
+SNAPSHOT_THREAD_CORE_PROPOSED=1 # 提案手法のSnapshotスレッド数（仮に1と設定）
+BASE_BACKGROUND_THREADS=4     # Dispatcher/Snapshot以外のBackgroundスレッド数
 
 # --- 測定回数 ---
 RUN_DURATION=10
@@ -52,22 +59,36 @@ echo "✅ 設定ファイルをバックアップ: $BACKUP_CONFIG_FILE"
 
 # ========================== 単一CSVファイルの設定 ==========================
 
-# --- SKEWレベルごとの設定をここで実施 ---
+# --- スレッド数とBackground数の計算 ---
 if [ "$TARGET" == "original" ]; then
-    NUM_BACKGROUND=4
+    # 従来手法: 提案手法のオーバーヘッド分をワーカー数に加算
+    NUM_DISPATCHERS=0
+    SNAPSHOT_THREAD_CORE=0
+    NUM_WORKERS=$((BASE_WORKERS + NUM_DISPATCHERS_PROPOSED + SNAPSHOT_THREAD_CORE_PROPOSED))
+    NUM_BACKGROUND=$BASE_BACKGROUND_THREADS
+    
     DEFINITIONS_FILE="definitions_original.hh"
     SOURCE_DIR="src_calvin" # 元カルバンのソースディレクトリ
-    NUM_DISPATCHERS=0 # 比較のため
-    OUTPUT_CSV="throughput_summary_${ARGUMENT}_original_w${FIXED_NUM_WORKERS}_all_skews.csv"
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_original_w_comp${BASE_WORKERS}_all_skews.csv"
 else
-    # 提案手法 (Dispatcherは1つで実験する例)
-    NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=4
-    NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
+    # 提案手法: ベースワーカー数 + 専用スレッド
+    NUM_DISPATCHERS=$NUM_DISPATCHERS_PROPOSED
+    SNAPSHOT_THREAD_CORE=$SNAPSHOT_THREAD_CORE_PROPOSED
+    NUM_WORKERS=$BASE_WORKERS
+    NUM_BACKGROUND=$((BASE_BACKGROUND_THREADS + NUM_DISPATCHERS + SNAPSHOT_THREAD_CORE))
+    
     DEFINITIONS_FILE="definitions_proposed.hh"
     SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ
-    OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}_w${FIXED_NUM_WORKERS}_all_skews.csv"
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}_s${SNAPSHOT_THREAD_CORE}_w${BASE_WORKERS}_all_skews.csv"
 fi
+
+echo "--- 実行構成 ($TARGET) ---"
+echo "  NUM_WORKERS: $NUM_WORKERS"
+echo "  NUM_DISPATCHERS: $NUM_DISPATCHERS"
+echo "  SNAPSHOT_THREAD_CORE: $SNAPSHOT_THREAD_CORE"
+echo "  NUM_BACKGROUND: $NUM_BACKGROUND"
+echo "--------------------------"
+
 
 # --- CSVファイル初期化 (ヘッダー書き込み) ---
 echo "Skew,Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
@@ -82,21 +103,18 @@ for SKEW in "${SKEW_LEVELS[@]}"; do
 
     # ========================== 測定実行 (固定スレッド) ==========================
     
-    # --- ワーカースレッド数を固定 ---
-    NUM_WORKERS=$FIXED_NUM_WORKERS
+    # --- ワーカースレッド数はループ外で設定済み ---
     
     if [ "$TARGET" == "original" ]; then
-        # 'original' の場合、X軸（スレッド数）はワーカー数
+        # 'original' の場合、比較対象の総アプリスレッドは $NUM_WORKERS
         THREADS_DISPLAY=$NUM_WORKERS
     else
-        # 'proposed' の場合、X軸はワーカー数＋ディスパッチャ数
-        THREADS_DISPLAY=$((NUM_WORKERS + NUM_DISPATCHERS))
+        # 'proposed' の場合、比較対象の総アプリスレッドは ワーカー+ディスパッチャ+スナップショット
+        THREADS_DISPLAY=$((NUM_WORKERS + NUM_DISPATCHERS + SNAPSHOT_THREAD_CORE))
     fi
     
-    echo -e "\n======== Workers=$NUM_WORKERS (Total App Cores: $THREADS_DISPLAY) (Skew: $SKEW) ========"
+    echo -e "\n======== Total App Cores: $THREADS_DISPLAY (Workers=$NUM_WORKERS) (Skew: $SKEW) ========"
     
-    # --- 'proposed' の場合、NUM_BACKGROUND は SKEW ループの *外* で設定済み ---
-    # --- 'original' の場合も同様 ---
     NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
     
     if [ "$NUM_CORE" -gt 72 ]; then
@@ -118,6 +136,7 @@ for SKEW in "${SKEW_LEVELS[@]}"; do
     sed -i -E "s/^#define[[:space:]]+NUM_WORKERS[[:space:]]+.*$/#define NUM_WORKERS $NUM_WORKERS/" src/common/definitions.hh
     if [ "$TARGET" != "original" ]; then
         sed -i -E "s/^#define[[:space:]]+NUM_RO_DISPATCHERS[[:space:]]+.*$/#define NUM_RO_DISPATCHERS $NUM_DISPATCHERS/" src/common/definitions.hh
+        sed -i -E "s/^#define[[:space:]]+SNAPSHOT_THREAD_CORE[[:space:]]+.*$/#define SNAPSHOT_THREAD_CORE $SNAPSHOT_THREAD_CORE/" src/common/definitions.hh
     fi
     
     # --- ビルド ---
@@ -180,13 +199,13 @@ for SKEW in "${SKEW_LEVELS[@]}"; do
         done
         
         AVERAGE_THROUGHPUT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_THROUGHPUT / $NUM_VALID_RUNS}")
-        echo "✅ 平均スループット (Workers=$NUM_WORKERS, $SKEW skew): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行から算出)"
+        echo "✅ 平均スループット (Total App Cores=$THREADS_DISPLAY, $SKEW skew): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行から算出)"
     else
         AVERAGE_THROUGHPUT="N/A"
-        echo "⚠️  Workers=$NUM_WORKERS ($SKEW skew) の有効な実行がなかったため、平均を計算できませんでした。"
+        echo "⚠️  Total App Cores=$THREADS_DISPLAY ($SKEW skew) の有効な実行がなかったため、平均を計算できませんでした。"
     fi
     
-    # CSVには、Skewレベル、スレッド数、平均スループットを記録
+    # CSVには、Skewレベル、比較スレッド総数、平均スループットを記録
     echo "$SKEW,$THREADS_DISPLAY,$AVERAGE_THROUGHPUT" >> "$OUTPUT_CSV"
     #
     # ★★★ Threadループを削除したため、'done' は不要 ★★★

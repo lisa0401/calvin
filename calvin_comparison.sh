@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# Calvin 比較実験用スクリプト (72コアサーバー向け)
+# Calvin 比較実験用スクリプト (72コアサーバー向け・スレッド数ごと・公平比較版)
 # ==============================================================================
 
 # --- 比較対象を設定 ('original' または 'proposed') ---
-TARGET="proposed" # ここを 'original' に変えて元カルバンを測定
+TARGET="original" # ここを 'original' に変えて元カルバンを測定
 
 # --- 引数処理 ---
 if [ "$1" == "m" ]; then
@@ -22,28 +22,50 @@ echo "🧪 使用するベンチマーク: $ARGUMENT"
 echo "🎯 測定対象: $TARGET"
 
 # ========================== 実験パラメータ ==========================
+
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★★★ ここを修正：提案手法の追加スレッド設定 ★★★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+NUM_DISPATCHERS_PROPOSED=1
+SNAPSHOT_THREAD_CORE_PROPOSED=1 # 提案手法のSnapshotスレッド数
+BASE_BACKGROUND_THREADS=4     # Dispatcher/Snapshot以外のBackgroundスレッド数
+
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ★★★ ここを修正：比較する総アプリスレッド数のリスト ★★★
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# (例: 34スレッド = original: 34W, proposed: 32W + 1D + 1S)
+THREAD_COUNTS=(3 8 16 32 64)
+
+
 if [ "$TARGET" == "original" ]; then
-    # --- 変更点: 'proposed' の OTHER_BACKGROUND_THREADS と合わせるため 5 に変更 ---
-    NUM_BACKGROUND=5
+    # 従来手法
+    NUM_DISPATCHERS=0
+    SNAPSHOT_THREAD_CORE=0
+    NUM_BACKGROUND=$BASE_BACKGROUND_THREADS # (4)
+    
     DEFINITIONS_FILE="definitions_original.hh"
     SOURCE_DIR="src_calvin" # 元カルバンのソースディレクトリ
-    OUTPUT_CSV="throughput_summary_${ARGUMENT}_original.csv"
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_original_comp.csv"
 else
-    # 提案手法 (Dispatcherは1つで実験する例)
-    NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=5
-    NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
+    # 提案手法: ベースワーカー数 + 専用スレッド
+    NUM_DISPATCHERS=$NUM_DISPATCHERS_PROPOSED
+    SNAPSHOT_THREAD_CORE=$SNAPSHOT_THREAD_CORE_PROPOSED
+    NUM_BACKGROUND=$((BASE_BACKGROUND_THREADS + NUM_DISPATCHERS + SNAPSHOT_THREAD_CORE)) # (4 + 1 + 1 = 6)
+    
     DEFINITIONS_FILE="definitions_proposed.hh"
     SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ
-    OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}.csv"
+    OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}_s${SNAPSHOT_THREAD_CORE}.csv"
 fi
 
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ★★★ ここを修正：72コアサーバー向けにテスト範囲を拡張 ★★★
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-THREAD_COUNTS=(2 4 8 16 32 64)
+echo "--- 実行構成 ($TARGET) ---"
+echo "  NUM_DISPATCHERS: $NUM_DISPATCHERS"
+echo "  SNAPSHOT_THREAD_CORE: $SNAPSHOT_THREAD_CORE"
+echo "  BASE_BACKGROUND_THREADS: $BASE_BACKGROUND_THREADS"
+echo "  TOTAL NUM_BACKGROUND: $NUM_BACKGROUND"
+echo "--------------------------"
 
-# <--- 変更点 No.1: 測定回数を60回に設定 ---
+
+# --- 測定回数 ---
 RUN_DURATION=10
 NUM_RUNS=4
 WARMUP_RUNS=0
@@ -60,25 +82,23 @@ rm -f /tmp/failed_log_*.log
 cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
 echo "✅ 設定ファイルをバックアップ: $BACKUP_CONFIG_FILE"
 echo "Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
+echo "📈 結果出力先: $OUTPUT_CSV"
 
 # ========================== メインループ ==========================
-for THREADS in "${THREAD_COUNTS[@]}"; do
-    echo -e "\n======== Total Cores for Workers+Dispatchers: $THREADS ========"
+for THREADS_DISPLAY in "${THREAD_COUNTS[@]}"; do
+    echo -e "\n======== Total App Cores: $THREADS_DISPLAY ========"
 
     # --- 公平な比較のためのワーカー数調整 ---
     if [ "$TARGET" == "original" ]; then
-        NUM_WORKERS=$THREADS
+        NUM_WORKERS=$THREADS_DISPLAY
     else
-        NUM_WORKERS=$((THREADS - NUM_DISPATCHERS))
+        NUM_WORKERS=$((THREADS_DISPLAY - NUM_DISPATCHERS - SNAPSHOT_THREAD_CORE))
         if [ "$NUM_WORKERS" -lt 1 ]; then
-            echo "ワーカー数が1未満になるためスキップします。"
+            echo "ワーカー数が1未満($NUM_WORKERS)になるためスキップします。"
             continue
         fi
     fi
     
-    # NUM_CORE の計算 (NUM_WORKERS + NUM_BACKGROUND)
-    # original の場合: THREADS + 5
-    # proposed の場合: (THREADS - 1) + (5 + 1) = THREADS + 5
     NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
     
     if [ "$NUM_CORE" -gt 72 ]; then
@@ -100,11 +120,13 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
     sed -i -E "s/^#define[[:space:]]+NUM_WORKERS[[:space:]]+.*$/#define NUM_WORKERS $NUM_WORKERS/" src/common/definitions.hh
     if [ "$TARGET" != "original" ]; then
         sed -i -E "s/^#define[[:space:]]+NUM_RO_DISPATCHERS[[:space:]]+.*$/#define NUM_RO_DISPATCHERS $NUM_DISPATCHERS/" src/common/definitions.hh
+        sed -i -E "s/^#define[[:space:]]+SNAPSHOT_THREAD_CORE[[:space:]]+.*$/#define SNAPSHOT_THREAD_CORE $SNAPSHOT_THREAD_CORE/" src/common/definitions.hh
     fi
+    
     # --- ビルド ---
     echo "  [2/4] ビルドを実行中..."
     cd src
-    make clean > /dev/null 2>&1
+    make clean > /dev/null 21
     if make -j$(nproc); then
         echo "      - ビルド成功。"
     else
@@ -119,6 +141,7 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
     THROUGHPUT_ARRAY=()
 
     for i in $(seq 1 $NUM_RUNS); do
+        # Skew引数は 0 (デフォルト) を使用
         ./bin/deployment/db 0 "$ARGUMENT" 0 > "$LOG_FILE" 2>&1 &
         APP_PID=$!
         sleep "$RUN_DURATION"
@@ -131,12 +154,11 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
 
         THROUGHPUT=$(grep -oP 'Completed\s*\K[0-9.]+' "$LOG_FILE" | tail -n 5 | head -n 1 | awk '{print $1}')
 
-        # <--- 変更点 No.2: 最初の10回は結果を保存しない ---
         if [ "$i" -le "$WARMUP_RUNS" ]; then
             echo "    - ウォームアップ実行 $i/$NUM_RUNS: 🚀 完了 (結果は破棄)"
         elif [ -z "$THROUGHPUT" ]; then
             echo "    - 測定実行 $i/$NUM_RUNS: ⚠️ スループット抽出失敗"
-            FAILED_LOG_NAME="/tmp/failed_log_threads_${THREADS}_run_${i}.log"
+            FAILED_LOG_NAME="/tmp/failed_log_threads_${THREADS_DISPLAY}_run_${i}.log"
             mv "$LOG_FILE" "$FAILED_LOG_NAME"
             echo "      (ログを ${FAILED_LOG_NAME} に保存しました)"
         else
@@ -148,22 +170,22 @@ for THREADS in "${THREAD_COUNTS[@]}"; do
 
     # ========================== 結果集計 ==========================
     echo "  [4/4] 結果を集計中..."
-    # <--- 変更点 No.3: 集計ロジックを修正 ---
     NUM_VALID_RUNS=${#THROUGHPUT_ARRAY[@]}
     if [ "$NUM_VALID_RUNS" -gt 0 ]; then
-        # 配列内のすべての有効なスループットを合計する
         TOTAL_THROUGHPUT=0
         for t in "${THROUGHPUT_ARRAY[@]}"; do
             TOTAL_THROUGHPUT=$(awk "BEGIN {print $TOTAL_THROUGHPUT + $t}")
         done
         
         AVERAGE_THROUGHPUT=$(awk "BEGIN {printf \"%.2f\", $TOTAL_THROUGHPUT / $NUM_VALID_RUNS}")
-        echo "✅ 平均スループット ($THREADS threads): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行から算出)"
+        echo "✅ 平均スループット (Total App Cores=$THREADS_DISPLAY): $AVERAGE_THROUGHPUT ops/sec ($NUM_VALID_RUNS 回の有効実行から算出)"
     else
         AVERAGE_THROUGHPUT="N/A"
-        echo "⚠️  $THREADS threads の有効な実行がなかったため、平均を計算できませんでした。"
+        echo "⚠️  Total App Cores=$THREADS_DISPLAY の有効な実行がなかったため、平均を計算できませんでした。"
     fi
-    echo "$THREADS,$AVERAGE_THROUGHPUT" >> "$OUTPUT_CSV"
+    
+    # CSVには、比較スレッド総数、平均スループットを記録
+    echo "$THREADS_DISPLAY,$AVERAGE_THROUGHPUT" >> "$OUTPUT_CSV"
 done
 
 # ========================== 後始末 ==========================
