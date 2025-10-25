@@ -46,11 +46,15 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
 
     PrintCpu("RO Dispatcher", dispatcher_id);
 
+    // 公開済みの最新エポックを取得するために SimpleStorage にキャスト
+    // ※ SimpleStorage に CurrentEpoch() のアクセサを用意してください（下に例を記載）
+    SimpleStorage* simple_storage = static_cast<SimpleStorage*>(scheduler->storage_);
+
     MessageProto message;
     while (true)
     {
-        if (!(*scheduler->ro_connections_)[dispatcher_id]->GetMessage(&message))
-        {
+        // 1) RO用コネクションからバッチ受信
+        if (!(*scheduler->ro_connections_)[dispatcher_id]->GetMessage(&message)) {
             usleep(50);
             continue;
         }
@@ -58,15 +62,16 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
 
         const double batch_recv_time = GetTime();
 
+        // 2) RO件数カウント
         int ro_cnt = 0;
         for (int i = 0; i < message.data_ptr_size(); ++i) {
             auto raw_ptr = message.data_ptr(i);
             TxnProto *t = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw_ptr));
-            if (t->has_read_only() && t->read_only())
-                ++ro_cnt;
+            if (t->has_read_only() && t->read_only()) ++ro_cnt;
         }
         if (ro_cnt == 0) continue;
 
+        // 3) ワーカーへのRR割り振り
         const uint64_t base = scheduler->ro_rr_ticket_.fetch_add(ro_cnt, std::memory_order_relaxed);
         uint64_t local = 0;
 
@@ -74,22 +79,24 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
         {
             auto raw_ptr = message.data_ptr(i);
             TxnProto *txn = reinterpret_cast<TxnProto *>(static_cast<uintptr_t>(raw_ptr));
-
             if (!(txn->has_read_only() && txn->read_only())) continue;
 
             txn->set_time_sequencer_begin(batch_recv_time);
             txn->set_time_sequencer_end(GetTime());
 
-            // ✅ txn の batch_number を基準に snapshot を決定
-            const uint64_t txn_batch = txn->batch_number();
-            const uint64_t snap_ep = (txn_batch > 0) ? (txn_batch - 1) : 0;
+            // ✅ 公開済みの最新スナップショットを読む
+            const int64_t snap_ep = simple_storage->CurrentEpoch();  // ★要アクセサ
+            // cut（txn_idの上限値）もメタとしてセット
             const int64_t snap_tx =
-                static_cast<int64_t>(snap_ep) * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
+                snap_ep * MAX_LOCK_BATCH_SIZE + (MAX_LOCK_BATCH_SIZE - 1);
 
             txn->set_snapshot_epoch(snap_ep);
             txn->set_snapshot_txn_id(snap_tx);
-            scheduler->storage_->PinEpoch(static_cast<int64>(snap_ep));
 
+            // RCU: 該当エポックを Pin（公開済みなので必ず存在）
+            scheduler->storage_->PinEpoch(snap_ep);
+
+            // ワーカーへディスパッチ
             scheduler->executing_txns_++;
             const uint64_t dest = (base + local) % NUM_WORKERS;
             ++local;
@@ -98,6 +105,7 @@ void *DeterministicScheduler::RODispatcherThread(void *arg)
     }
     return nullptr;
 }
+
 
 
 DeterministicScheduler::DeterministicScheduler(Configuration *conf,
@@ -313,28 +321,39 @@ MessageProto *GetBatch(int batch_id, Connection *connection, unordered_map<int, 
 }
 
 void* DeterministicScheduler::SnapshotThreadMain(void* arg) {
-    DeterministicScheduler *scheduler = reinterpret_cast<DeterministicScheduler *>(arg);
-    PrintCpu("Snapshotter", 0); // CPUバインド確認
+    DeterministicScheduler* scheduler = reinterpret_cast<DeterministicScheduler*>(arg);
+    PrintCpu("Snapshotter", 0);  // CPUアフィニティ確認
 
-    // Storage* を SimpleStorage* にキャストして専用APIを呼べるようにする
+    // Storage* を SimpleStorage* にキャスト（専用APIを使うため）
     SimpleStorage* storage = static_cast<SimpleStorage*>(scheduler->storage_);
 
     while (true) {
         SimpleStorage::SnapshotRequest* req = nullptr;
-        if (scheduler->snapshot_queue_->Pop(&req)) {
-            
-            // [低速処理] スナップショットを作成・公開する
-            // (内部で Table のフルコピー、デルタのマージ、RCU履歴マップのコピーが発生)
-            storage->ApplyAndPublishSnapshot(req);
-            
-        } else {
-            // キューが空なら少し待つ
-            // (ブロッキングキューを使っている場合はこの待機は不要)
-            usleep(500); // 500us
+
+        // スナップショット依頼を待つ
+        if (!scheduler->snapshot_queue_->Pop(&req)) {
+            // ブロッキングキューでない場合の軽いバックオフ
+            usleep(500);  // 500us
+            continue;
         }
+
+        // publish 対象の new_cut から、RO が読むべき直前エポック (B-1) を算出
+        const int64_t new_cut = req->new_cut;
+        const int64_t batch_B = static_cast<int64_t>(new_cut / MAX_LOCK_BATCH_SIZE);
+        const int64_t wait_ep = std::max<int64_t>(0, batch_B - 1);
+
+        // ★ 要件：RW も RO も終わってから publish する
+        // RO の読者数が 0 になるまで待機（Pin/Unpin により進行）
+        storage->WaitUntilNoReaders(wait_ep);
+
+        // 低速処理：スナップショットの適用と公開（RCUマップ更新・GC含む）
+        storage->ApplyAndPublishSnapshot(req);
+        // req は ApplyAndPublishSnapshot 内で delete 済み
     }
+
     return nullptr;
 }
+
 
 void *DeterministicScheduler::LockManagerThread(void *arg)
 {

@@ -42,6 +42,7 @@ public:
 
     SimpleStorage();
     virtual ~SimpleStorage();
+    int64 CurrentEpoch() const;
 
     // --- トランザクション実行 (Worker) / ロック管理 (LM) からの I/O ---
     virtual Value* ReadObject(const Key& key, int64 txn_id) override;
