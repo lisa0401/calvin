@@ -67,8 +67,8 @@ echo "--------------------------"
 
 # --- 測定回数 ---
 RUN_DURATION=10
-NUM_RUNS=4
-WARMUP_RUNS=0
+NUM_RUNS=60
+WARMUP_RUNS=10
 
 # --- 基本設定 ---
 SCRIPT_DIR=$(dirname "$0")

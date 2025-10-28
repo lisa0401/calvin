@@ -182,7 +182,7 @@ int main(int argc, char **argv)
     else if (argv[2][0] == 'y')
     {
         // YCSBのパラメータをここで自由に設定
-        const double read_ratio = 0.99;
+        const double read_ratio = 0.5;
         const double skew = 0.99;
         const uint64 db_size = DB_SIZE;
         const uint64 hot_records = 10; // この値はdefinitions.hhに移動するとより良い
