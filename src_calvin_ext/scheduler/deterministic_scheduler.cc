@@ -269,6 +269,15 @@ void *DeterministicScheduler::RunWorkerThread(void *arg)
                 (void)scheduler->storage_->ReadObject(txn->read_write_set(i), snap_txn);
             }
             txn->set_time_worker_end(GetTime());
+
+            // ▼▼▼ 修正点 ▼▼▼
+            // Unpin は done_queue に積む *前* に行う
+            // （LockManagerThread が snapshot_queue_ でブロックしていても Unpin が実行されるようにするため）
+            if (txn->has_snapshot_epoch()) {
+                scheduler->storage_->UnpinEpoch(txn->snapshot_epoch());
+            }
+            // ▲▲▲ 修正点 ▲▲▲
+
             scheduler->done_queue->Push(txn);
             continue;
         }
@@ -421,9 +430,14 @@ void *DeterministicScheduler::LockManagerThread(void *arg)
             empty_poll_streak = 0;
             if (done_txn->read_only()) {
                 // ... (RO完了処理、統計更新) ...
-                if (done_txn->has_snapshot_epoch()) {
-                    scheduler->storage_->UnpinEpoch(done_txn->snapshot_epoch());
-                }
+                
+                // ▼▼▼ 修正点 ▼▼▼
+                // UnpinEpoch は WorkerThread 側で実行済みのため、ここでは削除
+                // if (done_txn->has_snapshot_epoch()) {
+                //     scheduler->storage_->UnpinEpoch(done_txn->snapshot_epoch());
+                // }
+                // ▲▲▲ 修正点 ▲▲▲
+
                 if (done_txn->has_time_sequencer_begin()) {
                     double d = done_txn->time_sequencer_end() - done_txn->time_sequencer_begin();
                     double q = done_txn->time_worker_begin() - done_txn->time_sequencer_end();
