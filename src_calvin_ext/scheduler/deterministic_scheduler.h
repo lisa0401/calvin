@@ -17,7 +17,7 @@
 
 // ▼ 追加 ▼
 // SimpleStorage::SnapshotRequest* を使うためにインクルード
-#include "backend/simple_storage.h" 
+#include "backend/simple_storage.h"
 // ▲ 追加 ▲
 
 // （必要なら）ZeroMQ 前方宣言
@@ -52,6 +52,11 @@ public:
     // RO が読む「最後にコミット済みのバッチ番号」
     std::atomic<uint64_t> last_committed_batch_{0};
 
+    // ★ 追加：公開（publish）済みの最新エポック番号
+    // SnapshotThreadMain で ApplyAndPublishSnapshot 完了直後に更新し、
+    // RODispatcherThread からスナップショット epoch のクリップに使用する。
+    std::atomic<uint64_t> published_epoch_{0};
+
     // RW コミット前缶詰数（バッチ単位）
     std::map<int, int> pending_rw_per_batch_;
     int next_batch_to_commit_ = 0;
@@ -80,7 +85,7 @@ private:
     Storage* storage_;
     const Application* application_;
 
-    // 実行中トランザクション数（計測用）
+    // 実行中トランザクション数（計測用）— 複数スレッドから更新されるため atomic
     std::atomic<int> executing_txns_{0};
 
     // ===================== キュー / マネージャ =====================
@@ -88,18 +93,17 @@ private:
     AtomicQueue<TxnProto*>* ro_queues_[NUM_WORKERS];
 
     // RWキュー / 完了キュー
-    std::deque<TxnProto*>* ready_txns_;      // ロック獲得済みで実行待ちのRW
-    DeterministicLockManager* lock_manager_;
-    AtomicQueue<TxnProto*>* rw_txns_queue_;   // 実行ワーカーへ渡すRW
-    AtomicQueue<TxnProto*>* done_queue;       // 完了通知（RO/RW共通）
-    AtomicQueue<MessageProto>* message_queues[NUM_WORKERS];
-    Connection* thread_connections_[NUM_WORKERS];
+    std::deque<TxnProto*>*      ready_txns_;     // ロック獲得済みで実行待ちのRW
+    DeterministicLockManager*   lock_manager_;
+    AtomicQueue<TxnProto*>*     rw_txns_queue_;  // 実行ワーカーへ渡すRW
+    AtomicQueue<TxnProto*>*     done_queue;      // 完了通知（RO/RW共通）
+    AtomicQueue<MessageProto>*  message_queues[NUM_WORKERS];
+    Connection*                 thread_connections_[NUM_WORKERS];
 
     // ▼ 追加 ▼
-    // スナップショット要求を格納するキュー
+    // スナップショット要求を格納するキュー（LockManagerThread → SnapshotThreadMain）
     AtomicQueue<SimpleStorage::SnapshotRequest*>* snapshot_queue_;
     // ▲ 追加 ▲
-
 
     // ===================== スレッドハンドル =====================
     pthread_t threads_[NUM_WORKERS];

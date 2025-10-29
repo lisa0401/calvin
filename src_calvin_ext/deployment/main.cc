@@ -167,7 +167,7 @@ int main(int argc, char **argv)
     }
     else if (argv[2][0] == 'y')
     {
-        const double read_ratio = 0.5;
+        const double read_ratio = 0.99;
         const double skew = 0.99;
         const uint64 db_size = DB_SIZE;
         const uint64 hot_records = 10;
