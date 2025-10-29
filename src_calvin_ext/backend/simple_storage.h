@@ -1,107 +1,142 @@
-#ifndef _BACKEND_SIMPLE_STORAGE_H_
-#define _BACKEND_SIMPLE_STORAGE_H_
-
-#include "backend/storage.h"
+#ifndef DB_BACKEND_SIMPLE_STORAGE_H_
+#define DB_BACKEND_SIMPLE_STORAGE_H_
 
 #include <pthread.h>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <string>
+#include <utility>
 #include <vector>
 
+#include "backend/storage.h"  // Key, Value, int64, Storage の宣言
+
 class SimpleStorage : public Storage {
-public:
-    using Table = std::map<Key, Value*>;
+ public:
+  // ============ 型 ============
 
-    // ROトランザクション用のスナップショット（世代）定義
-    struct Snapshot {
-        std::shared_ptr<const Table> tbl; // スナップショット本体
-        mutable std::atomic<uint32_t> readers; // 参照中のROトランザクション数
-        int64 cut_end; // このスナップショットが有効な最終TXN ID
-        
-        // ▼ 追加 ▼
-        // コンストラクタ (atomic は { } で初期化できないため)
-        Snapshot(std::shared_ptr<const Table> t, uint32_t r, int64 c)
-            : tbl(t), readers(r), cut_end(c) {}
-    };
+  // Key→Value* のイミュータブル表
+  using Table = std::map<Key, Value *>;
 
-    // ▼ 変更 ▼
-    // マップの「値」を Snapshot そのものではなく、Snapshot へのポインタに変更
-    using EpochMap = std::map<int64, std::shared_ptr<Snapshot>>;
+  // 世代（エポック）ごとのスナップショット情報
+  struct Snapshot {
+    std::shared_ptr<const Table> tbl;   // 読み取り用テーブル（不変）
+    std::atomic<int> readers;           // Pin/Unpin 用の参照カウント
+    int64 cut_end;                      // このエポックがカバーする最大 cut（B*MAX-1）
+    Snapshot(std::shared_ptr<const Table> t, int readers0, int64 c)
+        : tbl(std::move(t)), readers(readers0), cut_end(c) {}
+  };
 
-    // スナップショット作成"依頼"を定義する構造体
-    struct SnapshotRequest {
-        std::shared_ptr<const Table> base_table;
-        std::vector<Table> captured_deltas;
-        int64 old_cut;
-        int64 new_cut;
-    };
+  using EpochMap = std::map<int64, std::shared_ptr<Snapshot>>;
 
-    SimpleStorage();
-    virtual ~SimpleStorage();
-    int64 CurrentEpoch() const;
+  // 差分（デルタ）用のシャード
+  struct DeltaShard {
+    pthread_mutex_t mu;
+    Table map;
+    DeltaShard() : mu(PTHREAD_MUTEX_INITIALIZER) {}
+  };
 
-    // --- トランザクション実行 (Worker) / ロック管理 (LM) からの I/O ---
-    virtual Value* ReadObject(const Key& key, int64 txn_id) override;
-    virtual bool PutObject(const Key& key, Value* value, int64 txn_id) override;
-    virtual bool DeleteObject(const Key& key, int64 txn_id) override;
+  // スナップショット公開要求（LockManagerThread → SnapshotThread）
+  struct SnapshotRequest {
+    std::shared_ptr<const Table> base_table;  // 現在の stable_curr_（基準）
+    int64 old_cut = -1;                       // 直前の cut_curr_
+    int64 new_cut = -1;                       // 新しく公開する cut
+    std::vector<Table> captured_deltas;       // シャードから吸い上げた差分
+  };
 
-    // --- ROトランザクション (RODispatcher) 用の I/O ---
-    virtual Value* ReadObjectAtEpoch(const Key& key, int64 epoch);
-    virtual void PinEpoch(int64 epoch) override;
-    virtual void UnpinEpoch(int64 epoch) override;
+  // ============ 定数 ============
+  static constexpr size_t kDeltaShards = 64;
 
-    // --- Storage 基底クラスの純粋仮想関数 (空実装) ---
-    virtual bool Prefetch(const Key& key, double* wait_time) override;
-    virtual bool Unfetch(const Key& key) override;
+  // ============ 構築 / 破棄 ============
+  SimpleStorage();
+  ~SimpleStorage() override;
 
-    // --- スナップショット管理 (LockManager / SnapshotThread) ---
-    virtual SnapshotRequest* CaptureDeltasAndCreateRequest(int64 new_curr_cut);
-    virtual void ApplyAndPublishSnapshot(SnapshotRequest* req);
+  // ============ Storage 抽象メソッド実装 ============
+  // RW 読み取り（txn_id は cut として扱う。負値なら最新版）
+  Value *ReadObject(const Key &key, int64 txn_id = 0) override;
 
-    // --- GC / デバッグ用 ---
-    virtual bool CanRecycleUpTo(int64 epoch) const;
-    virtual void WaitUntilNoReaders(int64 epoch);
+  // 書込みは差分へ（RW）
+  bool PutObject(const Key &key, Value *value, int64 txn_id = 0) override;
+  bool DeleteObject(const Key &key, int64 txn_id = 0) override;
 
+  // 事前取得（この実装では no-op）
+  bool Prefetch(const Key &key, double *wait_time) override;
+  bool Unfetch(const Key &key) override;
 
-private:
-    static Value* Tombstone() {
-        return reinterpret_cast<Value*>(0xDEADBEEF);
-    }
-    static size_t ShardFor(const Key& key) {
-        return std::hash<Key>()(key) % kDeltaShards;
-    }
+  // ============ 追加 API（RO fast-path 用） ============
+  // 指定エポックのスナップショットから読み取り（RO）
+  Value *ReadObjectAtEpoch(const Key &key, int64 epoch);
 
-    // ▼ 変更 ▼
-    void GCUnlocked(EpochMap* map_to_gc); // 引数の型を変更
+  // 現在公開済みの最新 cut / epoch を取得（RO が参照）
+  int64 LatestPublishedCut() const;
+  int64 LatestPublishedEpoch() const;
 
-    static const size_t kDeltaShards = 64;
-    static const size_t max_history_epochs_ = 64;
+  // cut（txn_id 空間）に対応する epoch を返す（存在しないなら最も近い過去の epoch）
+  int64 EpochForCut(int64 cut) const;
 
-    struct Shard {
-        alignas(64) pthread_mutex_t mu;
-        Table map;
-    };
+  // ピン/アンピン（GC 用）。RO fast-path では基本未使用だが互換のため残す。
+  void PinEpoch(int64 epoch) override;
+  void UnpinEpoch(int64 epoch) override;
 
-    std::vector<Shard> delta_;
-    std::shared_ptr<const Table> stable_prev_;
-    std::shared_ptr<const Table> stable_curr_;
-    std::atomic<int64> cut_prev_;
-    std::atomic<int64> cut_curr_;
+  // エポック操作ユーティリティ
+  bool CanRecycleUpTo(int64 epoch) const;
+  void WaitUntilNoReaders(int64 epoch);
+  int64 CurrentEpoch() const;
 
-    // --- RO用 RCU (Read-Copy-Update) 世代管理 ---
+  // ============ スナップショット公開 ============
+  // 高速部：差分を吸い上げて SnapshotRequest を構築（ロック最小化）
+  SnapshotRequest *CaptureDeltasAndCreateRequest(int64 new_curr_cut);
 
-    // ▼ 変更 ▼
-    // マップのポインタを保持 (マップの型が EpochMap に)
-    std::shared_ptr<const EpochMap> atomic_epochs_ptr_;
+  // 低速部：差分適用 → stable_{prev,curr}_ の入れ替え → RCU マップ更新 → GC → 公開通知
+  void ApplyAndPublishSnapshot(SnapshotRequest *req);
 
-    std::mutex hist_mu_;
-    std::condition_variable hist_cv_; 
-    int64 curr_epoch_;
-    int64 prev_epoch_;
+ private:
+  // Tombstone：削除マーカー
+  static inline Value *Tombstone() {
+    return reinterpret_cast<Value *>(-1);
+  }
+
+  // シャード関数
+  static inline size_t ShardFor(const Key &key) {
+    // 簡易ハッシュ（Key が std::string 相当なら std::hash で OK）
+    return std::hash<Key>{}(key) % kDeltaShards;
+  }
+
+  // 参照カットの切り替え／世代 GC（hist_mu_ 保持中に呼ぶ）
+  void GCUnlocked(EpochMap *map_to_gc);
+
+ private:
+  // ============ 差分（RW 書込み先） ============
+  std::vector<DeltaShard> delta_;
+
+  // ============ 安定スナップショット ============
+  std::shared_ptr<const Table> stable_prev_;  // 1つ前に公開したテーブル
+  std::shared_ptr<const Table> stable_curr_;  // 現在の安定テーブル
+
+  // ============ cut （txn_id 空間）の境界 ============
+  std::atomic<int64> cut_prev_;  // stable_prev_ がカバーする最大 cut
+  std::atomic<int64> cut_curr_;  // stable_curr_ がカバーする最大 cut
+
+  // ============ 公開済みメタ（RO参照用） ============
+  std::atomic<int64> latest_published_cut_;
+  std::atomic<int64> latest_published_epoch_;
+
+  // ============ RCU 風のエポック・スナップショットマップ ============
+  // 注意：std::shared_ptr は free 関数の atomic_load/atomic_store で RCU 的に切替
+  std::shared_ptr<const EpochMap> epochs_ptr_;
+
+  // ============ ヒストリ管理 ============
+  mutable std::mutex hist_mu_;
+  std::condition_variable hist_cv_;
+  int64 curr_epoch_ = 0;
+  int64 prev_epoch_ = -1;
+  size_t max_history_epochs_ = 3;  // 古い世代を保持する最大数（調整可）
+
+  // ============ 非コピー ============
+  SimpleStorage(const SimpleStorage &) = delete;
+  SimpleStorage &operator=(const SimpleStorage &) = delete;
 };
 
-#endif // _BACKEND_SIMPLE_STORAGE_H_
+#endif  // DB_BACKEND_SIMPLE_STORAGE_H_
