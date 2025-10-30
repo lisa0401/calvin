@@ -56,6 +56,5 @@ message MessageProto {
   // For (UN)LINK_CHANNEL messages, specifies the channel to be (un)linked
   // to the requesting Connection object.
   optional string channel_request = 1002;
-  
 }
 

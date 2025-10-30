@@ -29,10 +29,10 @@ if [ "$TARGET" == "original" ]; then
     OUTPUT_CSV="throughput_summary_${ARGUMENT}_original.csv"
 else
     # 提案手法 (Dispatcherは1つで実験する例)
-    NUM_DISPATCHERS=1
-    OTHER_BACKGROUND_THREADS=5
+    NUM_DISPATCHERS=0
+    OTHER_BACKGROUND_THREADS=4
     NUM_BACKGROUND=$((OTHER_BACKGROUND_THREADS + NUM_DISPATCHERS))
-    DEFINITIONS_FILE="definitions_proposed.hh"
+    DEFINITIONS_FILE="definitions_original.hh"
     SOURCE_DIR="src_calvin_ext" # 提案手法のソースディレクトリ
     OUTPUT_CSV="throughput_summary_${ARGUMENT}_proposed_d${NUM_DISPATCHERS}.csv"
 fi
@@ -40,7 +40,7 @@ fi
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 # ★★★ ここを修正：96コアサーバー向けにテスト範囲を拡張 ★★★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-THREAD_COUNTS=(1 2 4 8 16 24 32 48 64 72 80)
+THREAD_COUNTS=(1 16 32 64)
 
 # <--- 変更点 No.1: 測定回数を60回に設定 ---
 RUN_DURATION=10
@@ -63,24 +63,14 @@ echo "Threads,Average_Throughput(ops/sec)" > "$OUTPUT_CSV"
 # ========================== メインループ ==========================
 for THREADS in "${THREAD_COUNTS[@]}"; do
     echo -e "\n======== Total Cores for Workers+Dispatchers: $THREADS ========"
+    
+    # -------- [ここから修正] --------
+    # THREADS を NUM_WORKERS に設定
+    NUM_WORKERS=$THREADS
+    # NUM_CORE を計算 (ワーカー + バックグラウンド)
+    NUM_CORE=$(($NUM_WORKERS + $NUM_BACKGROUND))
+    # -------- [ここまで修正] --------
 
-    # --- 公平な比較のためのワーカー数調整 ---
-    if [ "$TARGET" == "original" ]; then
-        NUM_WORKERS=$THREADS
-    else
-        NUM_WORKERS=$((THREADS - NUM_DISPATCHERS))
-        if [ "$NUM_WORKERS" -lt 1 ]; then
-            echo "ワーカー数が1未満になるためスキップします。"
-            continue
-        fi
-    fi
-    
-    NUM_CORE=$((NUM_WORKERS + NUM_BACKGROUND))
-    if [ "$NUM_CORE" -gt 96 ]; then
-        echo "合計コア数($NUM_CORE)がサーバーの上限(96)を超えるためスキップします。"
-        continue
-    fi
-    
     echo "  - Configuration: Workers=$NUM_WORKERS, Background=$NUM_BACKGROUND, TotalCores=$NUM_CORE"
 
     # --- ソースコードと定義ファイルの更新 ---

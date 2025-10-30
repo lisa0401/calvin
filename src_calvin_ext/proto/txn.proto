@@ -53,19 +53,6 @@ message TxnProto {
   // Node ids of nodes that participate as readers and writers in this txn.
   repeated int32 readers = 40;
   repeated int32 writers = 41;
-
-  // A flag indicating that this transaction is read-only.
-  // Set by the sequencer.
-  optional bool read_only = 42;
-    optional double time_sequencer_begin = 100; // シーケンサー処理開始時刻
-  optional double time_sequencer_end   = 101; // シーケンサー処理終了時刻
-  optional double time_worker_begin    = 102; // ワーカー処理開始時刻
-  optional double time_worker_end      = 103; // ワーカー処理終了時刻
-  optional double sequencer_start_time = 104; // ← この行が原因です
-    // === Add: ROが読むスナップショット境界 ===
-  // 「このトランザクションは commit_epoch <= snapshot_epoch の最新版を読む」
-  optional uint64 snapshot_epoch   = 110;
-
-  // もしくは（あるいは併用）「commit_txn_id <= snapshot_txn_id の最新版を読む」
-  optional int64  snapshot_txn_id  = 111;
+  optional bool read_only = 43;
 }
+

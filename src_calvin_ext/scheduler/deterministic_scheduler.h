@@ -1,104 +1,98 @@
+// Author: Alexander Thomson (thomson@cs.yale.edu)
+// Author: Kun Ren (kun.ren@yale.edu)
+//
+// The deterministic lock manager implements deterministic locking as described
+// in 'The Case for Determinism in Database Systems', VLDB 2010. Each
+// transaction must request all locks it will ever need before the next
+// transaction in the specified order may acquire any locks. Each lock is then
+// granted to transactions in the order in which they requested them (i.e. in
+// the global transaction order).
 #ifndef _DB_SCHEDULER_DETERMINISTIC_SCHEDULER_H_
 #define _DB_SCHEDULER_DETERMINISTIC_SCHEDULER_H_
-
 #include <pthread.h>
-#include <atomic>
 #include <deque>
-#include <map>
-#include <vector>
-#include <mutex> // ★ 追加
-
 #include "scheduler/scheduler.h"
-#include "common/utils.h" // AtomicQueue はここにある
+#include "common/utils.h" // <-- [.hh から .h に修正]
 #include "common/definitions.hh"
 #include "proto/txn.pb.h"
 #include "proto/message.pb.h"
 
-// ZMQ 前方宣言
-namespace zmq
-{
-    class socket_t;
-    class message_t;
-}
-using zmq::socket_t;
 
-class Application;
+
+using std::deque;
+namespace zmq {
+class socket_t;
+class message_t;
+}  // namespace zmq
+using zmq::socket_t;
 class Configuration;
 class Connection;
 class DeterministicLockManager;
 class Storage;
 class TxnProto;
+class DeterministicScheduler : public Scheduler {
+ public:
+  enum Task {
+    ProcessDoneTransaction,
+    LoadNextBatch,
+    AdvanceBatch,
+    Locking,
+    ProcessReadyTransaction,
+    Size
+  };
+  DeterministicScheduler(Configuration* conf,
+                         Connection* batch_connection,
+                         Storage* storage,
+                         const Application* application);
+  virtual ~DeterministicScheduler();
+ private:
+  // Function for starting main loops in a separate pthreads.
+  static void* RunWorkerThread(void* arg);
+  static void* LockManagerThread(void* arg);
+  void SendTxnPtr(socket_t* socket, TxnProto* txn);
+  TxnProto* GetTxnPtr(socket_t* socket, zmq::message_t* msg);
+  // Configuration specifying node & system settings.
+  Configuration* configuration_;
+  
+  pthread_t lock_manager_thread_;
+  // Connection for receiving txn batches from sequencer.
+  Connection* batch_connection_;
+  // Storage layer used in application execution.
+  Storage* storage_;
+  // Application currently being run.
+  const Application* application_;
+  // The per-node lock manager tracks what transactions have temporary ownership
+  // of what database objects, allowing the scheduler to track LOCAL conflicts
+  // and enforce equivalence to transaction orders.
+  DeterministicLockManager* lock_manager_;
+  // Queue of transaction ids of transactions that have acquired all locks that
+  // they have requested.
+  std::deque<TxnProto*>* ready_txns_;
+  // Sockets for communication between main scheduler thread and worker threads.
+  //  socket_t* requests_out_;
+  //  socket_t* requests_in_;
+  //  socket_t* responses_out_[NUM_WORKERS];
+  //  socket_t* responses_in_;
+  
+  // RWトランザクション用のキュー (ロックマネージャ -> ワーカー)
+  AtomicQueue<TxnProto*>* txns_queue;
+  // 完了したRWトランザクション用のキュー (ワーカー -> ロックマネージャ)
+  AtomicQueue<TxnProto*>* done_queue;
+  
+  // -------- [ここへ移動] --------
+  // ROキュー振り分け用のラウンドロビンカウンター
+  uint64_t ro_counter_;
+  // -------- [ここまで] --------
 
-class DeterministicScheduler : public Scheduler
-{
-public:
-    DeterministicScheduler(Configuration *conf,
-                           Connection *rw_connection,
-                           std::vector<Connection *> *ro_connections,
-                           Storage *storage,
-                           const Application *application);
-    virtual ~DeterministicScheduler();
+  // --- 配列メンバはクラス定義の最後にまとめる ---
+  // Thread contexts and their associated Connection objects.
+  pthread_t threads_[NUM_WORKERS];
+  Connection* thread_connections_[NUM_WORKERS];
 
-    // RO が読む「最後にコミット済みのバッチ番号」
-    std::atomic<uint64_t> last_committed_batch_{0};
+  AtomicQueue<MessageProto>* message_queues[NUM_WORKERS];
+  
+  // ROトランザクション用のキュー (ロックマネージャ -> ワーカー)
+  AtomicQueue<TxnProto*>* ro_queues[NUM_WORKERS];
 
-    // RW コミット前缶詰数（バッチ単位）
-    std::map<int, int> pending_rw_per_batch_;
-    int next_batch_to_commit_ = 0;
-    std::mutex pending_mu_;
-
-private:
-    friend class MockDeterministicScheduler;
-
-    // スレッドエントリ
-    static void *RunWorkerThread(void *arg);
-    static void *LockManagerThread(void *arg);
-    static void *RODispatcherThread(void *arg);
-
-    // ZMQ 経由で TxnProto* を送受信（使うなら）
-    void SendTxnPtr(zmq::socket_t *socket, TxnProto *txn);
-    TxnProto *GetTxnPtr(zmq::socket_t *socket, zmq::message_t *msg);
-
-    // 構成
-    Configuration *configuration_;
-    Connection *rw_connection_;
-    std::vector<Connection *> *ro_connections_;
-    Storage *storage_;
-    const Application *application_;
-
-    // 実行中トランザクション数（計測用）
-    std::atomic<int> executing_txns_{0};
-
-    // ★ RO 用ロックフリー・キュー（ワーカ毎）: AtomicQueue は common/utils.h の実装を使用
-    AtomicQueue<TxnProto *> *ro_queues_[NUM_WORKERS];
-
-    // RWキュー / 完了キュー
-    std::deque<TxnProto *> *ready_txns_;
-    DeterministicLockManager *lock_manager_;
-    AtomicQueue<TxnProto *> *rw_txns_queue_;
-    AtomicQueue<TxnProto *> *done_queue;
-    AtomicQueue<MessageProto> *message_queues[NUM_WORKERS];
-    Connection *thread_connections_[NUM_WORKERS];
-
-    // スレッド
-    pthread_t threads_[NUM_WORKERS];
-    pthread_t lock_manager_thread_;
-    pthread_t ro_dispatcher_threads_[NUM_RO_DISPATCHERS];
-
-    // ---- 計測（RW）----
-    std::atomic<double> total_sequencer_time_{0};
-    std::atomic<double> total_queueing_time_{0};
-    std::atomic<double> total_worker_time_{0};
-    std::atomic<int> processed_rwt_count_{0};
-
-    // ---- 計測（RO）----
-    std::atomic<double> total_ro_dispatch_time_{0};
-    std::atomic<double> total_ro_queueing_time_{0};
-    std::atomic<double> total_ro_worker_time_{0};
-    std::atomic<int> processed_rot_count_{0};
-
-    // ★ Dispatcher 全体で共有するラウンドロビン用チケット
-    static std::atomic<uint64_t> ro_rr_ticket_;
 };
-
-#endif // _DB_SCHEDULER_DETERMINISTIC_SCHEDULER_H_
+#endif  // _DB_SCHEDULER_DETERMINISTIC_SCHEDULER_H_
