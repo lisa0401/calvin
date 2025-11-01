@@ -43,6 +43,7 @@ message MessageProto {
   // For TXN_BATCH messages, 'batch_number' identifies the epoch of the txn
   // batch being sent.
   optional int64 batch_number = 21;
+  optional bool batch_has_rw = 120;
 
   // For READ_RESULT messages, 'keys(i)' and 'values(i)' store the key and
   // result of a read, respectively.

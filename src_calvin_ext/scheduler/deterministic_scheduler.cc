@@ -158,63 +158,58 @@ void* DeterministicScheduler::RunWorkerThread(void* arg) {
         scheduler->thread_connections_[thread]->UnlinkChannel(
             IntToString(txn->txn_id()));
         active_txns.erase(message.destination_channel());
-        
-        // -------- [ここから変更] --------
-        // 完了したTxnはRO/RWに関わらず、カウントのためにdone_queueに送る
+
+        // 完了トランザクションを done_queue へ（RO/RW 共通）
         scheduler->done_queue->Push(txn);
-        // -------- [ここまで変更] --------
       }
     } else {
       // No remote read result found, try to get a new transaction.
 
-      // 1. 最初に RO キューをチェック
-      TxnProto* ro_txn;
-      bool got_ro = scheduler->ro_queues[thread]->Pop(&ro_txn);
-      if (got_ro == true) {
-        // Got a Read-Only txn.
+      // 1) まず RW キュー (txns_queue) をチェック
+      TxnProto* txn; // RW txn
+      bool got_rw = scheduler->txns_queue->Pop(&txn);
+      if (got_rw == true) {
+        // Create manager.
         StorageManager* manager = new StorageManager(
             scheduler->configuration_, scheduler->thread_connections_[thread],
-            scheduler->storage_, ro_txn);
+            scheduler->storage_, txn);
 
         if (manager->ReadyToExecute()) {
           // No remote reads. Execute and clean up.
-          scheduler->application_->Execute(ro_txn, manager);
+          scheduler->application_->Execute(txn, manager);
           delete manager;
-          
-          // -------- [ここから変更] --------
-          // 完了したRO Txnをdone_queueに送る
-          scheduler->done_queue->Push(ro_txn);
-          // -------- [ここまで変更] --------
+
+          // 完了したRW Txnをdone_queueに送る
+          scheduler->done_queue->Push(txn);
         } else {
-          // RO txn has outstanding remote reads.
           scheduler->thread_connections_[thread]->LinkChannel(
-              IntToString(ro_txn->txn_id()));
-          active_txns[IntToString(ro_txn->txn_id())] = manager;
+              IntToString(txn->txn_id()));
+          // There are outstanding remote reads.
+          active_txns[IntToString(txn->txn_id())] = manager;
         }
-      
+
       } else {
-        // 2. RO がなければ、RW キュー (txns_queue) をチェック
-        TxnProto* txn; // This is a RW txn
-        bool got_it = scheduler->txns_queue->Pop(&txn);
-        if (got_it == true) {
-          // Create manager.
+        // 2) RW が無ければ、RO キューをチェック
+        TxnProto* ro_txn;
+        bool got_ro = scheduler->ro_queues[thread]->Pop(&ro_txn);
+        if (got_ro == true) {
+          // Got a Read-Only txn.
           StorageManager* manager = new StorageManager(
               scheduler->configuration_, scheduler->thread_connections_[thread],
-              scheduler->storage_, txn);
+              scheduler->storage_, ro_txn);
 
-          // Writes occur at this node.
           if (manager->ReadyToExecute()) {
             // No remote reads. Execute and clean up.
-            scheduler->application_->Execute(txn, manager);
+            scheduler->application_->Execute(ro_txn, manager);
             delete manager;
 
-            // 完了したRW Txnをdone_queueに送る (ここは元から)
-            scheduler->done_queue->Push(txn);
+            // 完了したRO Txnをdone_queueに送る
+            scheduler->done_queue->Push(ro_txn);
           } else {
+            // RO txn has outstanding remote reads.
             scheduler->thread_connections_[thread]->LinkChannel(
-                IntToString(txn->txn_id()));
-            // There are outstanding remote reads.
-            active_txns[IntToString(txn->txn_id())] = manager;
+                IntToString(ro_txn->txn_id()));
+            active_txns[IntToString(ro_txn->txn_id())] = manager;
           }
         }
       }
@@ -222,6 +217,7 @@ void* DeterministicScheduler::RunWorkerThread(void* arg) {
   }
   return NULL;
 }
+
 
 DeterministicScheduler::~DeterministicScheduler() {}
 
